@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -20,6 +22,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/modelgroup"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -74,6 +77,10 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// ModelGroups 模型组注册表（可选；nil = 模型组路由全部 404）。
+	// 注册表由 main 装配并经面板保存配置热替换，handler 侧只读。
+	ModelGroups *modelgroup.Registry
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -135,18 +142,57 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
-	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletionsMain))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	// 模型组路由：不能用 ServeMux 通配段（/{group}/v1/... 与 /v1/{group}/... 两
+	// 形态互不为子集，重叠路径如 /v1/v1/... 会注册期 panic），改走 "/" 兜底分发
+	// 器（groupDispatch）手动解析两种形态后派发。组是否存在在请求期查注册表
+	//（面板热改立即生效）。
+	// 主形态 /{group}/v1/... 是 OpenAI 客户端的推荐 base_url（SDK 在其后拼
+	// /chat/completions）；别名形态 /v1/{group}/... 供习惯把组名放在 v1 后的调用方。
+	h.mux.HandleFunc("/", h.groupDispatch)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
 	return h
 }
 
+// groupDispatch 模型组路由分发器（"/" 兜底）：从路径提取组名并派发到组的
+// chat/models 处理器。非模型组路径统一回 OpenAI 风格 404。
+func (h *Handler) groupDispatch(w http.ResponseWriter, r *http.Request) {
+	p := r.URL.Path
+	name := ""
+	switch {
+	case r.Method == http.MethodPost && strings.HasSuffix(p, "/v1/chat/completions"):
+		// /{group}/v1/chat/completions（主形态）
+		name = strings.TrimPrefix(strings.TrimSuffix(p, "/v1/chat/completions"), "/")
+	case r.Method == http.MethodPost && strings.HasPrefix(p, "/v1/") && strings.HasSuffix(p, "/chat/completions"):
+		// /v1/{group}/chat/completions（别名形态）
+		name = strings.TrimSuffix(strings.TrimPrefix(p, "/v1/"), "/chat/completions")
+	case r.Method == http.MethodGet && strings.HasSuffix(p, "/v1/models"):
+		// /{group}/v1/models（主形态）
+		name = strings.TrimPrefix(strings.TrimSuffix(p, "/v1/models"), "/")
+	case r.Method == http.MethodGet && strings.HasPrefix(p, "/v1/") && strings.HasSuffix(p, "/models"):
+		// /v1/{group}/models（别名形态）
+		name = strings.TrimSuffix(strings.TrimPrefix(p, "/v1/"), "/models")
+	}
+	// 空段 / 多段（如 /a/b/v1/...）/ 恰为既有路径段 → 非模型组请求，普通 404。
+	if name == "" || strings.Contains(name, "/") || name == "v1" || name == "models" || name == "chat" {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "unknown endpoint: "+r.Method+" "+p)
+		return
+	}
+	r.SetPathValue("group", name)
+	if strings.HasSuffix(p, "/models") {
+		h.withAuth(h.modelsGrouped)(w, r)
+		return
+	}
+	h.withAuth(h.chatCompletionsGroup)(w, r)
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && isChatCompletionsPath(r.URL.Path) {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
@@ -280,6 +326,40 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   h.modelList(),
+	})
+}
+
+// modelsGrouped 模型组的模型列表（/{group}/v1/models 与 /v1/{group}/models 共用）：
+// 组钉了 Models 时只列组内模型且**按生效优先级输出**（倍率升序、免费在前，见
+// groupModelPriority），客户端取 data[0] 即组默认；组不限模型时输出与主路由
+// /v1/models 完全一致。OpenAI 客户端在 base_url 尾拼 /models 拉列表，本端点保证
+// 组 base_url 的可发现性。
+func (h *Handler) modelsGrouped(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("group")
+	g, ok := h.groupLookup(name)
+	if !ok {
+		writeOpenAIError(w, http.StatusNotFound, "unknown_model_group",
+			fmt.Sprintf("unknown model group: %q (configure it in panel: 模型与档位 → 模型组)", name))
+		return
+	}
+	list := h.modelList()
+	if len(g.Models) > 0 {
+		byBare := make(map[string][]map[string]any, len(list))
+		for _, entry := range list {
+			if id, _ := entry["id"].(string); id != "" {
+				bare := modelgroup.BareOf(id)
+				byBare[bare] = append(byBare[bare], entry)
+			}
+		}
+		filtered := make([]map[string]any, 0, len(g.Models))
+		for _, m := range h.groupModelPriority(&g) {
+			filtered = append(filtered, byBare[modelgroup.BareOf(m)]...)
+		}
+		list = filtered
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"object": "list",
+		"data":   list,
 	})
 }
 
@@ -506,7 +586,129 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 	return dynamicModelsCache.ids
 }
 
-func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+// chatCompletionsMain 主路由入口（/v1/chat/completions，无模型组上下文）。
+func (h *Handler) chatCompletionsMain(w http.ResponseWriter, r *http.Request) {
+	h.chatCompletions(w, r, "")
+}
+
+// chatCompletionsGroup 模型组路由入口（/{group}/v1/chat/completions 与
+// /v1/{group}/chat/completions 两种形态共用）：从路径段取组名。
+func (h *Handler) chatCompletionsGroup(w http.ResponseWriter, r *http.Request) {
+	h.chatCompletions(w, r, r.PathValue("group"))
+}
+
+// isChatCompletionsPath 报告路径是否为聊天补全端点（主路由 + 模型组两种形态）。
+// ServeHTTP 的请求追踪包裹据此识别，组路径与主路径同享 X-Request-Id / 请求指标。
+func isChatCompletionsPath(p string) bool {
+	if p == "/v1/chat/completions" {
+		return true
+	}
+	if !strings.HasSuffix(p, "/chat/completions") {
+		return false
+	}
+	rest := strings.TrimSuffix(p, "/chat/completions")
+	// "/{group}/v1" 形态：rest 以 "/v1" 结尾；"/v1/{group}" 形态：rest 以 "/v1/" 开头。
+	return strings.HasSuffix(rest, "/v1") || strings.HasPrefix(rest, "/v1/")
+}
+
+// groupLookup 按名查模型组；注册表未装配（nil）视为不存在。
+func (h *Handler) groupLookup(name string) (modelgroup.Group, bool) {
+	return h.cfg.ModelGroups.Lookup(name)
+}
+
+// groupModelPriority 返回组内模型的**生效优先级**顺序：按当前生效积分倍率升序
+// （限时免费 = 0，排最前），倍率相同的保持配置书写顺序；倍率未知（目录未刷新 /
+// 该域无此模型）排在有倍率者之后，同样保持书写顺序。配置里的行顺序因此退化为
+// 「同倍率下的次序」。默认模型选取与 /models 列表都以此顺序为准。
+func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
+	if g == nil || len(g.Models) == 0 {
+		return nil
+	}
+	type cand struct {
+		model string
+		rate  float64
+		known bool
+	}
+	cands := make([]cand, 0, len(g.Models))
+	for _, m := range g.Models {
+		realm, bare := resolveModel(m)
+		rate := ""
+		if h.cfg.Upstream != nil {
+			rate = h.cfg.Upstream.ModelRate(realm, bare)
+		}
+		v, err := strconv.ParseFloat(rate, 64)
+		cands = append(cands, cand{model: m, rate: v, known: err == nil})
+	}
+	sort.SliceStable(cands, func(i, j int) bool {
+		a, b := cands[i], cands[j]
+		if a.known != b.known {
+			return a.known // 已知倍率者靠前，未知者整体靠后
+		}
+		if !a.known {
+			return false // 都未知：保持书写顺序（稳定排序）
+		}
+		return a.rate < b.rate
+	})
+	out := make([]string, len(cands))
+	for i, c := range cands {
+		out[i] = c.model
+	}
+	return out
+}
+
+// groupDefaultModel 按组内模型**生效优先级**（倍率升序，见 groupModelPriority）选
+// 默认模型：取第一个未被模型级冷却（6004 / 11102 负缓存）阻塞的模型；全部阻塞时
+// 回退优先级最高者（让请求走正常错误路径，客户端拿到上游/模型级阻塞的如实报错，
+// 而不是编造 404）。组不限模型时返回空串（维持"无模型"请求的既有行为）。
+func (h *Handler) groupDefaultModel(g *modelgroup.Group) string {
+	order := h.groupModelPriority(g)
+	for _, m := range order {
+		bare := modelgroup.BareOf(m)
+		if h.cfg.Pool.ModelBlocked(bare).Blocked {
+			continue
+		}
+		return m
+	}
+	if len(order) > 0 {
+		return order[0]
+	}
+	return ""
+}
+
+// pickForGroup 模型组感知选号：
+//   - 组未钉账号（Accounts 空）→ 完全跟随账号池既有规则（成本分层 / 快过期加权 /
+//     粘性，与主路由同口径）；
+//   - 组钉了账号（Accounts 非空）→ **按序逐个尝试**（跳过本请求已试过的 uid），
+//     PickByUIDForModel 内部已做健康 / 模型级冷却 / 积分保底 / 在途占满四重校验，
+//     realm 不符的号跳过。清单内全部不可用 → 返回 nil（503），**不回落池外账号**：
+//     钉账号的语义是"只准用这几个号"，静默回落会破坏分组隔离的预期。
+func (h *Handler) pickForGroup(grp *modelgroup.Group, tried map[string]bool, model, realm string) *auth.Auth {
+	if grp != nil && len(grp.Accounts) > 0 {
+		for _, uid := range grp.Accounts {
+			if tried[uid] {
+				continue
+			}
+			if a := h.cfg.Pool.PickByUIDForModel(uid, model); a != nil && a.Realm() == realm {
+				return a
+			}
+		}
+		return nil
+	}
+	return h.cfg.Pool.PickExcludingForRealm(tried, model, realm)
+}
+
+func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupName string) {
+	// 模型组解析：组名来自路径段。未知组 → 404（组名合法但未配置，或未启用模型组）。
+	var grp *modelgroup.Group
+	if groupName != "" {
+		g, ok := h.groupLookup(groupName)
+		if !ok {
+			writeOpenAIError(w, http.StatusNotFound, "unknown_model_group",
+				fmt.Sprintf("unknown model group: %q (configure it in panel: 模型与档位 → 模型组)", groupName))
+			return
+		}
+		grp = &g
+	}
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
@@ -524,6 +726,35 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
+
+	// 模型组的模型裁决（在 realm 解析与粘性解析之前——后续选号/粘性/出站重写
+	// 都要基于裁决后的最终模型名）：
+	//   1. model 缺省或等于组名 → 按组内模型生效优先级（积分倍率升序、免费在前，
+	//      同倍率按书写顺序）取默认模型（见 groupDefaultModel），并把请求体 model
+	//      字段改写为选中值（客户端不用猜组内第一个模型叫什么）。
+	//   2. model 明确指定 → 必须在组内白名单（按裸名判等，Allow 剥 cn:/global: 前缀），
+	//      否则 400 model_not_in_group 并附允许清单（组不限模型时跳过校验）。
+	if grp != nil {
+		if bare := modelgroup.BareOf(peek.Model); bare == "" || bare == groupName {
+			if chosen := h.groupDefaultModel(grp); chosen != "" {
+				if peek.Model != chosen {
+					// setModelField 而非 rewriteModel：客户端可能根本没传 model 字段
+					//（组默认模型正是为此存在），字段缺失时要注入而不是保留原样。
+					body = setModelField(body, chosen)
+				}
+				peek.Model = chosen
+			}
+		} else if !grp.Allows(bare) {
+			allowed := make([]string, 0, len(grp.Models))
+			for _, m := range grp.Models {
+				allowed = append(allowed, modelgroup.BareOf(m))
+			}
+			writeOpenAIErrorHint(w, http.StatusBadRequest, "model_not_in_group",
+				fmt.Sprintf("model %q is not in group %q", peek.Model, groupName),
+				"allowed models in group "+groupName+": "+strings.Join(allowed, ", "))
+			return
+		}
+	}
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
@@ -561,6 +792,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
 			stickyUID = uid
 		}
+	}
+	// 模型组钉了账号清单时，粘性号必须也在清单内，否则本请求忽略粘性（保留绑定，
+	// 组内号成功后 Bind 会把会话重绑到组内号，下一跳自然对齐）。
+	if stickyUID != "" && grp != nil && len(grp.Accounts) > 0 && !grp.HasAccount(stickyUID) {
+		stickyUID = ""
 	}
 
 	// 轮级聚合键：按 body 里最后一条 user 消息派生（同轮内所有上游调用同键，
@@ -736,9 +972,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if acct == nil {
-			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
-			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			// 组感知选号：组钉了账号 → 按组内顺序逐个尝试（不回落池外）；
+			// 未钉 → 模型感知 + realm 感知普通轮换（模型非空时启用 6004 模型级
+			// 冷却豁免 healthyForModel，realm 谓词过滤跨域账号），与主路由同口径。
+			acct = h.pickForGroup(grp, tried, bareModel, realm)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -1148,6 +1385,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
+}
+
+// setModelField 强制写入/覆盖请求体的 model 字段。与 rewriteModel（logging.go）
+// 的区别：字段缺失时注入而非保留——模型组的默认模型选择要给没传 model 的请求
+// 补上组内选中的模型名，否则出站 body 无 model 会被上游 400。
+func setModelField(body []byte, model string) []byte {
+	if len(body) == 0 || model == "" {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	if cur, _ := obj["model"].(string); cur == model {
+		return body
+	}
+	obj["model"] = model
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。

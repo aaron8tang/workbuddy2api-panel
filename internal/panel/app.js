@@ -9,6 +9,7 @@ let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
+let mgGroups = [], mgAccts = [], mgEditing = -1;   // 模型组（模型与档位视图）
 let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
@@ -334,6 +335,7 @@ function go(v) {
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
+  if (v === 'models') loadModelGroups();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
@@ -709,6 +711,138 @@ function renderModels() {
     : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型'
     : mdAll.length + ' 个模型';
   $('mdCount').className = filtered ? 'note src-off' : 'note';
+}
+
+/* ── 模型组（/{组名}/v1 独立路由）─────────────────────────────────────
+   组 = { name, models[], accounts[] }：
+   - models 顺序即默认模型优先级（客户端 model 缺省/等于组名时按序取第一个未被
+     模型级限流的模型）；空 = 组内不限模型。
+   - accounts 按序优先；空 = 按账号池既有规则选号（优先免费/低费率/粘性）。
+   保存走 POST /panel/api/model_groups：服务端深合并落盘 config.json 并热替换
+   注册表，路由立即生效、无需重启。 */
+async function loadModelGroups() {
+  try {
+    const d = await api('model_groups');
+    mgGroups = d.groups || [];
+    mgAccts = d.accounts || [];
+    renderMg();
+    $('mgNote').textContent = mgGroups.length ? mgGroups.length + ' 个模型组' : '';
+  } catch (e) {
+    $('mgNote').textContent = '读取失败：' + esc(e.message);
+  }
+}
+
+function mgRowHtml(g, i) {
+  const models = (g.models || []).length
+    ? (g.models || []).map(esc).join(' → ')
+    : '<span style="color:var(--ink-3)">不限模型</span>';
+  const accts = (g.accounts || []).length
+    ? (g.accounts || []).map(uid => {
+        const a = mgAccts.find(x => x.uid === uid);
+        return a && a.nickname ? esc(a.nickname) + '<span class="of">·' + esc(uid.slice(0, 8)) + '</span>' : esc(uid.slice(0, 12));
+      }).join(' → ')
+    : '<span style="color:var(--ink-3)">按账号池规则</span>';
+  return '<tr>' +
+    '<td><span class="tag ok">' + esc(g.name) + '</span></td>' +
+    '<td class="mg-mono">/' + esc(g.name) + '/v1</td>' +
+    '<td style="white-space:normal">' + models + '</td>' +
+    '<td style="white-space:normal">' + accts + '</td>' +
+    '<td class="acts">' +
+      '<button class="xs ghost" data-a="mg-edit" data-i="' + i + '">编辑</button>' +
+      '<button class="xs ghost danger" data-a="mg-del" data-i="' + i + '">删除</button>' +
+    '</td></tr>';
+}
+
+function renderMg() {
+  const tb = $('mgBody');
+  tb.innerHTML = mgGroups.length
+    ? mgGroups.map(mgRowHtml).join('')
+    : '<tr><td colspan="5"><div class="empty">暂无模型组 —— 点右上角「新建模型组」，为不同客户端暴露独立的 API 地址</div></td></tr>';
+}
+
+const MG_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
+function mgOpenEditor(i) {
+  mgEditing = i;
+  const g = i >= 0 ? (mgGroups[i] || {}) : {};
+  $('mgName').value = g.name || '';
+  // 编辑态禁改组名：组名即路由路径段（/{组名}/v1），改名等于删除重建，避免歧义。
+  $('mgName').disabled = i >= 0;
+  $('mgModels').value = (g.models || []).join('\n');
+  $('mgAccounts').value = (g.accounts || []).join('\n');
+  $('mgEditNote').textContent = '';
+  mgUpdatePreview();
+  mgRenderChips();
+  $('mgEditor').hidden = false;
+  // 用 center 而不是 nearest：编辑器高约 300px，nearest 在顶边已入视口时不再滚动，
+  // 保存/取消按钮会留在折叠线下，用户会以为「点了没反应」。
+  $('mgEditor').scrollIntoView({ block: 'center' });
+}
+
+function mgUpdatePreview() {
+  $('mgPreview').textContent = '/' + ($('mgName').value.trim() || '{组名}') + '/v1';
+}
+
+function mgLines(taId) {
+  return $(taId).value.split('\n').map(s => s.trim()).filter(Boolean);
+}
+
+// mgRenderChips 可点选的模型/账号 chips：点一下追加到对应 textarea（已存在则置灰）。
+// 模型来自模型目录缓存 mdAll（需先点上方「重新获取」拉一次）；账号来自池清单。
+function mgRenderChips() {
+  const curM = mgLines('mgModels');
+  $('mgModelChips').innerHTML = mdAll.length
+    ? mdAll.slice(0, 80).map(m => {
+        const used = curM.includes(m.id);
+        return '<span class="tag warn mg-chip' + (used ? ' used' : '') + '" data-mg-model="' + esc(m.id) +
+          '" title="' + esc(m.name || m.id) + '">' + esc(m.id) + '</span>';
+      }).join('')
+    : '<span class="note">点上方「重新获取」拉取模型目录后，可在此点选模型</span>';
+  const curA = mgLines('mgAccounts');
+  $('mgAcctChips').innerHTML = mgAccts.length
+    ? mgAccts.map(a => {
+        const used = curA.includes(a.uid);
+        const label = (a.nickname || a.uid.slice(0, 8)) +
+          (a.realm === 'global' ? '·国际版' : '') + (a.disabled ? '·已禁用' : '');
+        return '<span class="tag warn mg-chip' + (used ? ' used' : '') + '" data-mg-acct="' + esc(a.uid) +
+          '" title="' + esc(a.uid) + '">' + esc(label) + '</span>';
+      }).join('')
+    : '<span class="note">账号池为空（先到「账号池」添加账号）</span>';
+}
+
+function mgAppendLine(taId, val) {
+  const lines = mgLines(taId);
+  if (!lines.includes(val)) {
+    lines.push(val);
+    $(taId).value = lines.join('\n');
+  }
+  mgRenderChips();
+}
+
+async function mgPost(groups) {
+  try {
+    const d = await api('model_groups', { method: 'POST', body: JSON.stringify({ groups }) });
+    mgGroups = d.groups || groups;
+    renderMg();
+    $('mgEditor').hidden = true;
+    mgEditing = -1;
+    $('mgNote').textContent = mgGroups.length ? mgGroups.length + ' 个模型组' : '';
+    toast('模型组已保存并生效（无需重启）', 'ok');
+  } catch (e) {
+    $('mgEditNote').textContent = '保存失败：' + e.message;
+  }
+}
+
+async function mgSave() {
+  const name = $('mgName').value.trim();
+  if (mgEditing < 0 && !MG_NAME_RE.test(name)) {
+    $('mgEditNote').textContent = '组名不合法：小写字母/数字开头，仅含小写字母、数字、-、_，1-32 字符';
+    return;
+  }
+  const groups = mgGroups.slice();
+  const g = { name, models: mgLines('mgModels'), accounts: mgLines('mgAccounts') };
+  if (mgEditing >= 0) groups[mgEditing] = g; else groups.push(g);
+  await mgPost(groups);
 }
 
 function resetModelFilter() {
@@ -2807,3 +2941,37 @@ async function loadExpiry(force) {
 if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
 
 if ($('btnPk')) $('btnPk').onclick = loadPackages;
+
+/* ── 模型组：事件绑定 ──────────────────────────────────────────────── */
+if ($('mgBody')) {
+  $('mgBody').addEventListener('click', e => {
+    const b = e.target.closest('button[data-a]');
+    if (!b) return;
+    const i = Number(b.dataset.i);
+    if (b.dataset.a === 'mg-edit') {
+      mgOpenEditor(i);
+    } else if (b.dataset.a === 'mg-del') {
+      if (confirm('删除模型组「' + mgGroups[i].name + '」？其 /' + mgGroups[i].name + '/v1 路由将立即失效。')) {
+        mgPost(mgGroups.filter((_, j) => j !== i));
+      }
+    }
+  });
+}
+if ($('btnMgAdd')) $('btnMgAdd').onclick = () => mgOpenEditor(-1);
+if ($('btnMgSave')) $('btnMgSave').onclick = mgSave;
+if ($('btnMgCancel')) $('btnMgCancel').onclick = () => { $('mgEditor').hidden = true; mgEditing = -1; };
+if ($('mgName')) $('mgName').oninput = mgUpdatePreview;
+if ($('mgModels')) $('mgModels').oninput = mgRenderChips;
+if ($('mgAccounts')) $('mgAccounts').oninput = mgRenderChips;
+if ($('mgModelChips')) {
+  $('mgModelChips').addEventListener('click', e => {
+    const chip = e.target.closest('[data-mg-model]');
+    if (chip) mgAppendLine('mgModels', chip.dataset.mgModel);
+  });
+}
+if ($('mgAcctChips')) {
+  $('mgAcctChips').addEventListener('click', e => {
+    const chip = e.target.closest('[data-mg-acct]');
+    if (chip) mgAppendLine('mgAccounts', chip.dataset.mgAcct);
+  });
+}

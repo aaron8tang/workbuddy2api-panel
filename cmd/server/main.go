@@ -19,6 +19,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/modelgroup"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -262,6 +263,17 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	// 模型组注册表：装配期以 config.model_groups.groups 初始化；面板保存配置时
+	// 经 Replace 热替换。空清单 = 未启用模型组（/{group}/v1/* 恒 404，零回归）。
+	mgr := modelgroup.NewRegistry(cfg.ModelGroups.Groups)
+	if len(cfg.ModelGroups.Groups) > 0 {
+		names := make([]string, 0, len(cfg.ModelGroups.Groups))
+		for _, g := range cfg.ModelGroups.Groups {
+			names = append(names, g.Name)
+		}
+		log.Printf("模型组已启用：%v（API 形态 /{组名}/v1/chat/completions，OpenAI base_url 填 /{组名}/v1）", names)
+	}
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -274,6 +286,9 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		// 模型组注册表：面板「模型与档位 → 模型组」在线编辑后经 SaveConfig 热替换
+		//（路由 pattern 是通配 {group} 段，组存在性在请求期查表，无需重启）。
+		ModelGroups: mgr,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -282,7 +297,7 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, mgr)
 		},
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
@@ -310,6 +325,8 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 模型组注册表（/{group}/v1/* 路由的请求期查表；面板保存后热替换）。
+		ModelGroups: mgr,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -419,7 +436,7 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, mgr *modelgroup.Registry) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -505,6 +522,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	// 模型组热生效：路由 pattern 是通配 {group} 段，注册表整体替换后下一个请求
+	// 即按新清单路由（新增/删除组均无需重启）。
+	mgr.Replace(newCfg.ModelGroups.Groups)
 
 	return restartRequiredFields(newCfg), nil
 }

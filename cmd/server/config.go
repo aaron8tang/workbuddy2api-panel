@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/modelgroup"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
@@ -212,6 +213,14 @@ type Config struct {
 		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
+
+	// ModelGroups 模型组（面板「模型与档位 → 模型组」可在线编辑，热生效）：
+	// 按组暴露独立 OpenAI 兼容路由 /{组名}/v1/chat/completions 与 /{组名}/v1/models
+	// （另有 /v1/{组名}/... 别名）。组内 Models 顺序即默认模型优先级，Accounts
+	// 为组内账号优先级（空 = 跟随账号池既有选号规则）。清单可为空/缺省（零回归）。
+	ModelGroups struct {
+		Groups []modelgroup.Group `json:"groups"`
+	} `json:"model_groups"`
 
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
@@ -592,6 +601,10 @@ func (c *Config) normalize() error {
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
 	}
 	if err := c.validateScheduleHours(); err != nil {
+		return err
+	}
+	// 模型组：名称合法性/唯一性/保留字校验（trim 就地规范化）。空清单合法。
+	if err := modelgroup.Validate(c.ModelGroups.Groups); err != nil {
 		return err
 	}
 	return c.normalizePrompt()

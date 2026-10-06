@@ -586,6 +586,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .exp-main .note { margin-top: 2px; font-size: 11px; color: var(--ink-3); }
   .exp-main.err { color: var(--bad); }
 
+  /* 模型组（模型与档位视图）：编辑器行 = 左侧标签 + 输入区 + 可点选 chips。 */
+  .mg-row { display: flex; align-items: flex-start; gap: 12px; padding: 7px 0; }
+  .mg-row + .mg-row { border-top: 1px dashed var(--line-soft); }
+  .mg-label { flex: none; width: 8.5em; font-weight: 600; font-size: 12.5px; padding-top: 6px; }
+  .mg-input { flex: 0 1 26em; min-width: 12em; padding: 6px 9px; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--surface); color: var(--ink); font: inherit; font-size: 12.5px; }
+  textarea.mg-input { resize: vertical; font-family: var(--mono); line-height: 1.55; }
+  .mg-input:focus { outline: none; border-color: var(--accent); }
+  .mg-chips { flex: 1; display: flex; flex-wrap: wrap; gap: 5px; align-content: flex-start; padding-top: 4px; }
+  .mg-chip { cursor: pointer; user-select: none; }
+  .mg-chip:hover { filter: brightness(1.08); }
+  .mg-chip.used { opacity: .38; pointer-events: none; }
+  .mg-mono { font-family: var(--mono); color: var(--ink); font-weight: 600; }
+  .mg-actions { display: flex; align-items: center; gap: 8px; padding-top: 10px; }
+  .mg-actions .note { margin-left: 4px; }
+
 </style>
 </head>
 <body>
@@ -730,6 +746,43 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 模型与档位 -->
     <section class="view" id="view-models" hidden>
+      <div class="box" id="mgBox">
+        <header>
+          <h3>模型组 <span class="hint">按组暴露独立 API：OpenAI 客户端 base_url 填 http://host:7863/{组名}/v1（SDK 在其后拼 /chat/completions），也兼容 /v1/{组名}/… 形态；组内模型按积分倍率从小到大使用（限时免费排最前，倍率相同按下列顺序），账号顺序留空时按账号池规则（优先免费 / 低费率）选号</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="mgNote"></span>
+          <button class="xs primary" id="btnMgAdd">新建模型组</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr><th>组名</th><th>API 地址（base_url）</th><th>模型（顺序 = 默认优先级）</th><th>账号顺序</th><th class="c-acts"></th></tr></thead>
+          <tbody id="mgBody"></tbody>
+        </table>
+        </div>
+        <div class="pad" id="mgEditor" hidden>
+          <div class="mg-row">
+            <span class="mg-label">组名</span>
+            <input id="mgName" type="text" class="mg-input" placeholder="如 dev / chat（小写字母数字开头，可含 - _）">
+            <span class="note">API：<span id="mgPreview" class="mg-mono">/{组名}/v1</span></span>
+          </div>
+          <div class="mg-row">
+            <span class="mg-label">模型<br><span class="note">每行一个<br>按倍率升序使用<br>同倍率看顺序<br>留空 = 不限模型</span></span>
+            <textarea id="mgModels" class="mg-input" rows="4" placeholder="cn:glm-5.2&#10;cn:deepseek-v4-flash"></textarea>
+            <div class="mg-chips" id="mgModelChips"></div>
+          </div>
+          <div class="mg-row">
+            <span class="mg-label">账号顺序<br><span class="note">每行一个 uid<br>按序优先<br>留空 = 按池规则选号</span></span>
+            <textarea id="mgAccounts" class="mg-input" rows="3" placeholder="uid1（昵称 A）&#10;uid2（昵称 B）"></textarea>
+            <div class="mg-chips" id="mgAcctChips"></div>
+          </div>
+          <div class="mg-actions">
+            <button class="xs primary" id="btnMgSave">保存</button>
+            <button class="xs ghost" id="btnMgCancel">取消</button>
+            <span class="note" id="mgEditNote"></span>
+          </div>
+        </div>
+      </div>
+
       <div class="box">
         <header>
           <h3>模型能力 <span class="hint">max_tokens bug已修复目前可以正常透传最大输出,但是官方返回的最大输出仅为参考，不保证完全正确

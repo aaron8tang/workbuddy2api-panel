@@ -84,5 +84,14 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
+  },
+  "model_groups": {
+    "groups": [
+      {
+        "name": "dev",
+        "models": ["cn:glm-5.2", "cn:deepseek-v4-flash"],
+        "accounts": []
+      }
+    ]
   }
 }

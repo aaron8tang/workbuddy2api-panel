@@ -641,6 +641,26 @@ http://127.0.0.1:7863/panel/
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
 
+#### 模型组（`/{组名}/v1/*`）
+
+在 config.json `model_groups.groups`（或面板「模型与档位 → 模型组」在线编辑，保存即热生效、无需重启）中定义组后，每组暴露独立的 OpenAI 兼容路由：
+
+```text
+主形态（推荐）：base_url = http://host:7863/{组名}/v1     ← OpenAI SDK 的 base_url 约定以 /v1 结尾
+    POST {组名}/v1/chat/completions      GET {组名}/v1/models
+别名形态：     http://host:7863/v1/{组名}/...
+```
+
+组字段与语义：
+
+| 字段 | 语义 |
+|---|---|
+| `name` | 组名 = URL 路径段；小写字母/数字开头，可含 `-` `_`，不与 `v1`/`panel`/`status`/`healthz` 等保留路径冲突 |
+| `models` | 组内模型白名单，**顺序即默认模型优先级**；空 = 不限模型 |
+| `accounts` | 组内账号 UID 优先级，按序尝试（跳过冷却/占满/禁用号），**全部不可用即 503、不回落池外账号**；空 = 跟随账号池既有选号规则（成本分层 / 快过期加权 / 粘性会话） |
+
+行为细节：客户端 `model` 缺省或等于组名时，按 `models` 顺序取第一个未被模型级限流（6004/11102）的模型并改写出站请求体；`model` 明确指定但不在白名单 → 400 `model_not_in_group`（附允许清单）；`{组名}/v1/models` 只列组内模型且按组内顺序输出。组名不存在 → 404 `unknown_model_group`。
+
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 
 ```json

@@ -24,6 +24,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/modelgroup"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -43,6 +44,10 @@ type Config struct {
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
+
+	// ModelGroups 模型组注册表（「模型与档位 → 模型组」视图读写展示）。
+	// main 装配注入，SaveConfig 闭包在落盘后热替换（nil = 接口返回空清单）。
+	ModelGroups *modelgroup.Registry
 
 	// ConfigPath config.json 路径与加载器（配置页读写用）。
 	// LoadConfig 返回解析后的配置对象（前端展示/校验用，具体类型由 main 注入的闭包决定）；
@@ -154,6 +159,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("GET /panel/api/model_groups", p.withAuth(p.modelGroupsGet))
+	p.mux.HandleFunc("POST /panel/api/model_groups", p.withAuth(p.modelGroupsSave))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
