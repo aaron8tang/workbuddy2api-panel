@@ -729,13 +729,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 
 	// 模型组的模型裁决（在 realm 解析与粘性解析之前——后续选号/粘性/出站重写
 	// 都要基于裁决后的最终模型名）：
-	//   1. model 缺省或等于组名 → 按组内模型生效优先级（积分倍率升序、免费在前，
-	//      同倍率按书写顺序）取默认模型（见 groupDefaultModel），并把请求体 model
-	//      字段改写为选中值（客户端不用猜组内第一个模型叫什么）。
-	//   2. model 明确指定 → 必须在组内白名单（按裸名判等，Allow 剥 cn:/global: 前缀），
-	//      否则 400 model_not_in_group 并附允许清单（组不限模型时跳过校验）。
+	//   1. model 缺省、等于组名、或字面量 "default" → 按组内模型生效优先级（积分
+	//      倍率升序、免费在前，同倍率按书写顺序）取默认模型（见 groupDefaultModel），
+	//      并把请求体 model 字段改写为选中值（客户端不用猜组内第一个模型叫什么）。
+	//      "default" 单独等同缺省：多家客户端（以及上游主路由）把 "default" 当作
+	//      "用默认模型" 的别名而非真实模型名，组路由对齐该约定。
+	//   2. model 明确指定其它值 → 必须在组内白名单（按裸名判等，Allow 剥
+	//      cn:/global: 前缀），否则 400 model_not_in_group 并附允许清单（组不限
+	//      模型时跳过校验）。
 	if grp != nil {
-		if bare := modelgroup.BareOf(peek.Model); bare == "" || bare == groupName {
+		if bare := modelgroup.BareOf(peek.Model); bare == "" || bare == groupName || bare == "default" {
 			if chosen := h.groupDefaultModel(grp); chosen != "" {
 				if peek.Model != chosen {
 					// setModelField 而非 rewriteModel：客户端可能根本没传 model 字段

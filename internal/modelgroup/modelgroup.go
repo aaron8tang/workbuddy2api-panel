@@ -37,9 +37,13 @@ type Group struct {
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 // reserved 组名保留字：与网关既有顶层路径段冲突，禁止用作组名。
+// "chat" 单列：server 的兜底分发器把 POST /chat/v1/... 视为非模型组请求直接 404
+//（见 server.groupDispatch 的排除段），留着会让"配置能存、路由却 404"两处口径打架，
+// 故在此一并禁掉，让校验在配置/面板保存期就报错。
 var reserved = map[string]bool{
 	"v1": true, "panel": true, "status": true, "healthz": true,
 	"static": true, "assets": true, "favicon.ico": true,
+	"chat": true,
 }
 
 // ValidName 报告组名是否合法且未与既有路径冲突。

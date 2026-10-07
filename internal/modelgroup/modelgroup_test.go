@@ -26,6 +26,7 @@ func TestValidate(t *testing.T) {
 		{"empty name", []Group{{Name: " "}}},
 		{"reserved v1", []Group{{Name: "v1"}}},
 		{"reserved panel", []Group{{Name: "panel"}}},
+		{"reserved chat", []Group{{Name: "chat"}}},
 		{"uppercase", []Group{{Name: "Dev"}}},
 		{"bad char", []Group{{Name: "de v"}}},
 		{"leading dash", []Group{{Name: "-dev"}}},
@@ -41,11 +42,11 @@ func TestValidate(t *testing.T) {
 
 func TestBareOf(t *testing.T) {
 	cases := map[string]string{
-		"cn:glm-5.2":        "glm-5.2",
-		"global:gpt-x":      "gpt-x",
-		"glm-5.2":           "glm-5.2",
-		"other:model:x":     "other:model:x", // 非 cn/global 前缀视为裸名
-		"":                  "",
+		"cn:glm-5.2":    "glm-5.2",
+		"global:gpt-x":  "gpt-x",
+		"glm-5.2":       "glm-5.2",
+		"other:model:x": "other:model:x", // 非 cn/global 前缀视为裸名
+		"":              "",
 	}
 	for in, want := range cases {
 		if got := BareOf(in); got != want {
@@ -86,6 +87,9 @@ func TestRegistry(t *testing.T) {
 	}
 	if _, ok := r.Lookup("v1"); ok {
 		t.Error("reserved name should never resolve even if injected")
+	}
+	if _, ok := r.Lookup("chat"); ok {
+		t.Error("reserved name chat should never resolve even if injected")
 	}
 	// Replace 热替换：旧组消失、新组可见（面板保存路径）。
 	r.Replace([]Group{{Name: "ops"}})

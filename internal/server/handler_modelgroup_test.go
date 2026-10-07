@@ -143,8 +143,8 @@ func TestChatGroupModelWhitelist(t *testing.T) {
 	}
 }
 
-// TestChatGroupDefaultModel 组内模型顺序 = 默认模型优先级：model 缺省或等于组名
-// 时按序取第一个可用模型，并把请求体 model 改写为该值。
+// TestChatGroupDefaultModel 组内模型顺序 = 默认模型优先级：model 缺省、等于组名、
+// 或字面量 "default" 时按序取第一个可用模型，并把请求体 model 改写为该值。
 func TestChatGroupDefaultModel(t *testing.T) {
 	up := newRecordUpstream(t)
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
@@ -153,8 +153,9 @@ func TestChatGroupDefaultModel(t *testing.T) {
 	})
 
 	for _, body := range []string{
-		`{"messages":[]}`,               // model 缺省
-		`{"model":"dev","messages":[]}`, // model = 组名
+		`{"messages":[]}`,                   // model 缺省
+		`{"model":"dev","messages":[]}`,     // model = 组名
+		`{"model":"default","messages":[]}`, // model = "default"（等同缺省）
 	} {
 		rec := postChat(h, "/dev/v1/chat/completions", body)
 		if rec.Code != http.StatusOK {
@@ -162,8 +163,13 @@ func TestChatGroupDefaultModel(t *testing.T) {
 		}
 	}
 	_, models := up.snapshot()
-	if len(models) != 2 || models[0] != "deepseek-v4-flash" || models[1] != "deepseek-v4-flash" {
-		t.Fatalf("outbound models = %v, want both deepseek-v4-flash (first in group order)", models)
+	if len(models) != 3 {
+		t.Fatalf("outbound calls = %v, want 3", models)
+	}
+	for i, m := range models {
+		if m != "deepseek-v4-flash" {
+			t.Fatalf("outbound models[%d] = %q, want deepseek-v4-flash (first in group order)", i, m)
+		}
 	}
 }
 
