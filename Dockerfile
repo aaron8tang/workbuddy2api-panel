@@ -1,5 +1,10 @@
-# syntax=docker/dockerfile:1
+# 本地构建说明（国内环境）：
+# 1) 原 # syntax=docker/dockerfile:1 需从 Docker Hub 拉取 frontend，已移除——
+#    本文件仅用经典语法（多阶段 / COPY --from），内置 BuildKit 即可。
+# 2) 基础镜像已从 docker.m.daocloud.io 拉取并 retag 为 golang:1.23-alpine / alpine:3.20。
 FROM golang:1.23-alpine AS build
+# go mod download 走国内代理（默认 proxy.golang.org 不可达）
+ENV GOPROXY=https://goproxy.cn,direct
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download
