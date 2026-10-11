@@ -353,7 +353,16 @@ func (h *Handler) modelsGrouped(w http.ResponseWriter, r *http.Request) {
 		}
 		filtered := make([]map[string]any, 0, len(g.Models))
 		for _, m := range h.groupModelPriority(&g) {
-			filtered = append(filtered, byBare[modelgroup.BareOf(m)]...)
+			// 组条目可带思考强度档位（"模型|档位"，groupModelPriority 已剥离）：
+			// 匹配按裸名；档位覆盖条目的 reasoning_effort 透出（覆盖目录默认档），
+			// 客户端拉 /models 即可发现组内生效档位。
+			eff := g.EffortOf(modelgroup.BareOf(m))
+			for _, entry := range byBare[modelgroup.BareOf(m)] {
+				if eff != "" {
+					entry["reasoning_effort"] = eff
+				}
+				filtered = append(filtered, entry)
+			}
 		}
 		list = filtered
 	}
@@ -620,6 +629,8 @@ func (h *Handler) groupLookup(name string) (modelgroup.Group, bool) {
 // （限时免费 = 0，排最前），倍率相同的保持配置书写顺序；倍率未知（目录未刷新 /
 // 该域无此模型）排在有倍率者之后，同样保持书写顺序。配置里的行顺序因此退化为
 // 「同倍率下的次序」。默认模型选取与 /models 列表都以此顺序为准。
+// 返回元素为剥掉思考强度后缀的条目原文（"cn:glm-5.3-flash|max" → "cn:glm-5.3-
+// flash"，档位由 groupEffortFor 按 bare 反查）；倍率查找同样基于剥离后的名字。
 func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 	if g == nil || len(g.Models) == 0 {
 		return nil
@@ -631,13 +642,14 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 	}
 	cands := make([]cand, 0, len(g.Models))
 	for _, m := range g.Models {
-		realm, bare := resolveModel(m)
+		entry, _ := modelgroup.SplitEffort(m)
+		realm, bare := resolveModel(entry)
 		rate := ""
 		if h.cfg.Upstream != nil {
 			rate = h.cfg.Upstream.ModelRate(realm, bare)
 		}
 		v, err := strconv.ParseFloat(rate, 64)
-		cands = append(cands, cand{model: m, rate: v, known: err == nil})
+		cands = append(cands, cand{model: entry, rate: v, known: err == nil})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		a, b := cands[i], cands[j]
@@ -660,19 +672,22 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 // 默认模型：取第一个未被模型级冷却（6004 / 11102 负缓存）阻塞的模型；全部阻塞时
 // 回退优先级最高者（让请求走正常错误路径，客户端拿到上游/模型级阻塞的如实报错，
 // 而不是编造 404）。组不限模型时返回空串（维持"无模型"请求的既有行为）。
-func (h *Handler) groupDefaultModel(g *modelgroup.Group) string {
+// 第二返回值为该模型的思考强度配置（组条目 "|档位" 后缀，见 Group.Models），
+// 供组路由注入 reasoning_effort；未配置返回 ""（绝不注入，默认档由上游自决）。
+func (h *Handler) groupDefaultModel(g *modelgroup.Group) (string, string) {
 	order := h.groupModelPriority(g)
 	for _, m := range order {
 		bare := modelgroup.BareOf(m)
 		if h.cfg.Pool.ModelBlocked(bare).Blocked {
 			continue
 		}
-		return m
+		return m, g.EffortOf(bare)
 	}
 	if len(order) > 0 {
-		return order[0]
+		bare := modelgroup.BareOf(order[0])
+		return order[0], g.EffortOf(bare)
 	}
-	return ""
+	return "", ""
 }
 
 // pickForGroup 模型组感知选号：
@@ -729,32 +744,50 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 
 	// 模型组的模型裁决（在 realm 解析与粘性解析之前——后续选号/粘性/出站重写
 	// 都要基于裁决后的最终模型名）：
-	//   1. model 缺省或等于组名 → 按组内模型生效优先级（积分倍率升序、免费在前，
-	//      同倍率按书写顺序）取默认模型（见 groupDefaultModel），并把请求体 model
-	//      字段改写为选中值（客户端不用猜组内第一个模型叫什么）。
-	//   2. model 明确指定 → 必须在组内白名单（按裸名判等，Allow 剥 cn:/global: 前缀），
-	//      否则 400 model_not_in_group 并附允许清单（组不限模型时跳过校验）。
+	//   1. model 缺省、等于组名、或字面量 "default" → 按组内模型生效优先级（积分
+	//      倍率升序、免费在前，同倍率按书写顺序）取默认模型（见 groupDefaultModel），
+	//      并把请求体 model 字段改写为选中值（客户端不用猜组内第一个模型叫什么）。
+	//      "default" 单独等同缺省：多家客户端（以及上游主路由）把 "default" 当作
+	//      "用默认模型" 的别名而非真实模型名，组路由对齐该约定。
+	//   2. model 明确指定其它值 → 必须在组内白名单（按裸名判等，Allow 剥
+	//      cn:/global: 前缀），否则 400 model_not_in_group 并附允许清单（组不限
+	//      模型时跳过校验）。
 	if grp != nil {
-		if bare := modelgroup.BareOf(peek.Model); bare == "" || bare == groupName {
-			if chosen := h.groupDefaultModel(grp); chosen != "" {
+		if bare := modelgroup.BareOf(peek.Model); bare == "" || bare == groupName || bare == "default" {
+			if chosen, eff := h.groupDefaultModel(grp); chosen != "" {
 				if peek.Model != chosen {
 					// setModelField 而非 rewriteModel：客户端可能根本没传 model 字段
 					//（组默认模型正是为此存在），字段缺失时要注入而不是保留原样。
 					body = setModelField(body, chosen)
 				}
 				peek.Model = chosen
+				if eff != "" {
+					body = setReasoningEffortField(body, eff)
+				}
 			}
 		} else if !grp.Allows(bare) {
 			allowed := make([]string, 0, len(grp.Models))
 			for _, m := range grp.Models {
-				allowed = append(allowed, modelgroup.BareOf(m))
+				if mm, _ := modelgroup.SplitEffort(m); mm != "" {
+					allowed = append(allowed, modelgroup.BareOf(mm))
+				}
 			}
 			writeOpenAIErrorHint(w, http.StatusBadRequest, "model_not_in_group",
 				fmt.Sprintf("model %q is not in group %q", peek.Model, groupName),
 				"allowed models in group "+groupName+": "+strings.Join(allowed, ", "))
 			return
+		} else if eff := grp.EffortOf(bare); eff != "" {
+			// 客户端点名组内模型且该条目配置了思考强度：同样强制注入/覆盖。
+			body = setReasoningEffortField(body, eff)
 		}
 	}
+
+	// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本
+	// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的 tools」
+	// 与「会话历史里出现过的工具名」两个来源——实测 tools 声明会在中转环节丢失，
+	// 只认前者会让修复层在最需要它的场景下失效。
+	// 在提示词/模型名改写之前取（那些改写不动 tools / messages[].tool_calls 子树）。
+	declaredTools := upstream.ToolNameAllowlist(body)
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
@@ -1193,9 +1226,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 			// 组装请求上下文做判定）。
 			// errFrame：上游 error 帧原文（观察者旁路采集），用于流尾的账号处置。
 			var errFrame string
+			// 标记修复：上游在没有 tools 的请求里会把工具调用吐成原生标记文本，
+			// 这里在透传前还原成 delta.tool_calls（见 upstream/dsml.go）。
+			// 第二个参数为 true = 名单为空时启用弱判定——tools 声明在链路上丢失是
+			// 实测最常见的泄漏成因，只做严格判定等于对主场景不设防。
+			repair := upstream.NewMarkupRepair(declaredTools, true)
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }))
+			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
+				upstream.WithMarkupRepair(repair))
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
@@ -1249,6 +1288,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 			if st.hasCache {
 				cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
 			}
+			if n := repair.Converted(); n > 0 {
+				// 修复命中：上游本来会把工具调用吐成正文标记，这里已还原成 tool_calls。
+				// 打一行便于运维确认「这次不再空转」以及统计发生率。
+				log.Printf("INFO: [server] stream acct=%s model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, n, len(declaredTools))
+			} else if m := repair.Seen(); m > 0 {
+				// 识别到标记却没还原：说明判定没过（工具名不合规 / 块内夹带正文 /
+				// 参数畸形）。单独记一行，排障时能一眼区分「没识别到」与「识别到但拒绝」。
+				log.Printf("WARN: [server] stream acct=%s model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, m, len(declaredTools))
+			}
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1277,6 +1327,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 			st.status = http.StatusBadGateway
 			st.outcome = reqlog.OutcomeHTTPError
 			return
+		}
+		// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
+		// 只在「没有结构化 tool_calls」且「finish_reason 为 stop」时生效（见 dsml.go）；
+		// 名单为空时走弱判定（tools 声明在中转环节丢失是常态）。
+		mrepair := upstream.RepairAggregatedResponse(resp, declaredTools, true)
+		if n := mrepair.Converted(); n > 0 {
+			log.Printf("INFO: [server] non-stream model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
+				bareModel, n, len(declaredTools))
+		} else if m := mrepair.Seen(); m > 0 {
+			log.Printf("WARN: [server] non-stream model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
+				bareModel, m, len(declaredTools))
 		}
 		credit, total, hasCredit := usageCreditTotal(resp)
 		if usage, ok := resp["usage"].(map[string]any); ok {
@@ -1409,6 +1470,30 @@ func setModelField(body []byte, model string) []byte {
 	return out
 }
 
+// setReasoningEffortField 强制写入/覆盖请求体的 reasoning_effort（思考强度）字段。
+// 仅组路由在组条目显式配置了档位（"模型|档位" 后缀，见 modelgroup.Group.Models）
+// 时调用——**绝不隐式注入**：实测上游对不认档位词的模型会把思考直接关掉（如
+// glm-5.3-flash 传 high/low/medium/xhigh 均 reasoning_tokens=0），默认档必须交给
+// 上游自决。客户端自带值也被覆盖：组配置即开发基线。
+func setReasoningEffortField(body []byte, effort string) []byte {
+	if len(body) == 0 || effort == "" {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	if cur, _ := obj["reasoning_effort"].(string); cur == effort {
+		return body
+	}
+	obj["reasoning_effort"] = effort
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
 //
 // 分母用「生成耗时」= 端到端耗时 - 首 token 等待（TTFB），不是端到端耗时。
@@ -1425,6 +1510,11 @@ func setModelField(body []byte, model string) []byte {
 // 同理，ttfb 不小于总耗时时（时钟粒度、或 TTFB 落在计时终点之后）退回端到端耗时，
 // 避免零/负分母。token 数为负哨兵值（-1 = 观测缺失）时返回 false。
 //
+// 扣除后不足 minGenWindow 也退回端到端（issue #127）：ttfb 量的是「首个 SSE 帧
+// 到达」，当上游把整个响应攒到最后一次性下发（假流式/中间层攒批刷新——首帧与
+// 末帧几乎同时到）时，total−ttfb 只剩几毫秒，拿它当分母会把几百 token 除成
+// 上万 tok/s 的幻数。这种形态下「生成时长」根本不可测，诚实的分母只有端到端。
+//
 // 用量账本（handler）与控制台流水行（logging.go）都走这一个函数：两处各算一遍时
 // 口径漂移过一次（流水行漏扣 TTFB、与面板数字对不上），共用是防再次分叉的唯一办法。
 func tokensPerSecond(completionTokens int64, total, ttfb time.Duration) (float64, bool) {
@@ -1433,12 +1523,18 @@ func tokensPerSecond(completionTokens int64, total, ttfb time.Duration) (float64
 	}
 	gen := total
 	if ttfb > 0 {
-		if g := total - ttfb; g > 0 {
+		if g := total - ttfb; g >= minGenWindow {
 			gen = g
 		}
 	}
 	return float64(completionTokens) / gen.Seconds(), true
 }
+
+// minGenWindow 可信生成窗口的下限：扣除 TTFB 后剩余窗口不足该值即视为「生成
+// 时长不可测」，退回端到端耗时（见 tokensPerSecond 注释，issue #127）。
+// 真流式下首帧到末帧通常铺满剩余窗口，200ms 远低于正常生成时长，不影响真实
+// 快速输出（如缓存命中后的爆发）被如实报告。
+const minGenWindow = 200 * time.Millisecond
 
 // promptTooLongMessage 11115 透传 message：上游 body 原文（含真实 token 数/
 // 上限值/requestId，客户端自行排查）；空 body 兜底为可读分类短文案（不编造原文）。

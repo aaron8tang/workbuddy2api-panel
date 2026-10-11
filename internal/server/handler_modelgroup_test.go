@@ -22,12 +22,13 @@ import (
 )
 
 // recordUpstream 记录每次出站请求的 Authorization（账号识别）与出站 body 的
-// model 字段（模型重写断言）。聊天行为恒 200 SSE 成功。
+// model / reasoning_effort 字段（模型重写与思考强度注入断言）。聊天行为恒 200 SSE 成功。
 type recordUpstream struct {
-	up     *upstream.Client
-	mu     sync.Mutex
-	tokens []string
-	models []string
+	up      *upstream.Client
+	mu      sync.Mutex
+	tokens  []string
+	models  []string
+	efforts []string
 }
 
 func newRecordUpstream(t *testing.T) *recordUpstream {
@@ -38,13 +39,15 @@ func newRecordUpstream(t *testing.T) *recordUpstream {
 			r.mu.Lock()
 			r.tokens = append(r.tokens, req.Header.Get("Authorization"))
 			var peek struct {
-				Model string `json:"model"`
+				Model           string `json:"model"`
+				ReasoningEffort string `json:"reasoning_effort"`
 			}
 			if req.Body != nil {
 				raw, _ := io.ReadAll(req.Body)
 				_ = json.Unmarshal(raw, &peek)
 			}
 			r.models = append(r.models, peek.Model)
+			r.efforts = append(r.efforts, peek.ReasoningEffort)
 			r.mu.Unlock()
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -58,10 +61,10 @@ func newRecordUpstream(t *testing.T) *recordUpstream {
 	return r
 }
 
-func (r *recordUpstream) snapshot() (tokens, models []string) {
+func (r *recordUpstream) snapshot() (tokens, models, efforts []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]string{}, r.tokens...), append([]string{}, r.models...)
+	return append([]string{}, r.tokens...), append([]string{}, r.models...), append([]string{}, r.efforts...)
 }
 
 func newGroupHandler(p *pool.Pool, up *upstream.Client, groups []modelgroup.Group) *Handler {
@@ -137,14 +140,14 @@ func TestChatGroupModelWhitelist(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("member model: got %d, want 200", rec.Code)
 	}
-	_, models := up.snapshot()
+	_, models, _ := up.snapshot()
 	if len(models) != 1 || models[0] != "glm-5.2" {
 		t.Fatalf("outbound model = %v, want [glm-5.2] (bare, prefix stripped)", models)
 	}
 }
 
-// TestChatGroupDefaultModel 组内模型顺序 = 默认模型优先级：model 缺省或等于组名
-// 时按序取第一个可用模型，并把请求体 model 改写为该值。
+// TestChatGroupDefaultModel 组内模型顺序 = 默认模型优先级：model 缺省、等于组名、
+// 或字面量 "default" 时按序取第一个可用模型，并把请求体 model 改写为该值。
 func TestChatGroupDefaultModel(t *testing.T) {
 	up := newRecordUpstream(t)
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
@@ -153,17 +156,23 @@ func TestChatGroupDefaultModel(t *testing.T) {
 	})
 
 	for _, body := range []string{
-		`{"messages":[]}`,               // model 缺省
-		`{"model":"dev","messages":[]}`, // model = 组名
+		`{"messages":[]}`,                   // model 缺省
+		`{"model":"dev","messages":[]}`,     // model = 组名
+		`{"model":"default","messages":[]}`, // model = "default"（等同缺省）
 	} {
 		rec := postChat(h, "/dev/v1/chat/completions", body)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("body %s: got %d, want 200", body, rec.Code)
 		}
 	}
-	_, models := up.snapshot()
-	if len(models) != 2 || models[0] != "deepseek-v4-flash" || models[1] != "deepseek-v4-flash" {
-		t.Fatalf("outbound models = %v, want both deepseek-v4-flash (first in group order)", models)
+	_, models, _ := up.snapshot()
+	if len(models) != 3 {
+		t.Fatalf("outbound calls = %v, want 3", models)
+	}
+	for i, m := range models {
+		if m != "deepseek-v4-flash" {
+			t.Fatalf("outbound models[%d] = %q, want deepseek-v4-flash (first in group order)", i, m)
+		}
 	}
 }
 
@@ -182,7 +191,7 @@ func TestChatGroupAccountOrder(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
 	}
-	tokens, _ := up.snapshot()
+	tokens, _, _ := up.snapshot()
 	if len(tokens) != 1 || !strings.HasSuffix(tokens[0], "at2") {
 		t.Fatalf("first pick should be u2 (group order), got %v", tokens)
 	}
@@ -205,7 +214,7 @@ func TestChatGroupAccountPinnedNoFallback(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("got %d, want 503 (pinned account unavailable, no fallback)", rec.Code)
 	}
-	tokens, _ := up.snapshot()
+	tokens, _, _ := up.snapshot()
 	if len(tokens) != 0 {
 		t.Fatalf("no upstream call expected, got %v", tokens)
 	}
@@ -366,5 +375,70 @@ func TestModelsGrouped(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
 	if out.Object != "list" || out.Data == nil {
 		t.Fatalf("unexpected models payload: %s", rec.Body.String())
+	}
+}
+
+// TestChatGroupEffortInjection 组条目配置思考强度（"模型|档位"）时，组路由对该
+// 模型的请求强制注入/覆盖出站 body 的 reasoning_effort：
+//  1. 默认模型选中带档位条目 → 注入 max；
+//  2. 客户端点名该模型且自带 reasoning_effort:"low" → 覆盖为 max（组配置即基线）；
+//  3. 组配置档位的 deepseek 系模型 → 出站 max（组配置优先于 thinking.go 的
+//     deepseek 缺档回退 high——组注入在出站管线之前，已有档位时回退跳过）。
+func TestChatGroupEffortInjection(t *testing.T) {
+	up := newRecordUpstream(t)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := newGroupHandler(p, up.up, []modelgroup.Group{
+		{Name: "dev", Models: []string{"cn:glm-5.3-flash|max", "cn:deepseek-v4-flash|max"}},
+	})
+
+	// 1) 默认模型（假上游无目录倍率 → 按书写顺序取 glm-5.3-flash|max）。
+	if rec := postChat(h, "/dev/v1/chat/completions", `{"messages":[]}`); rec.Code != http.StatusOK {
+		t.Fatalf("default model: got %d, want 200", rec.Code)
+	}
+	// 2) 客户端点名 + 自带档位 → 覆盖。
+	if rec := postChat(h, "/dev/v1/chat/completions",
+		`{"model":"cn:glm-5.3-flash","reasoning_effort":"low","messages":[]}`); rec.Code != http.StatusOK {
+		t.Fatalf("member model with own effort: got %d, want 200", rec.Code)
+	}
+	// 3) deepseek 系 + 组配置档位 → 组配置压过缺档回退。
+	if rec := postChat(h, "/dev/v1/chat/completions",
+		`{"model":"cn:deepseek-v4-flash","messages":[]}`); rec.Code != http.StatusOK {
+		t.Fatalf("deepseek member: got %d, want 200", rec.Code)
+	}
+
+	_, models, efforts := up.snapshot()
+	if len(models) != 3 || len(efforts) != 3 {
+		t.Fatalf("outbound calls = %v, efforts = %v, want 3 each", models, efforts)
+	}
+	if models[0] != "glm-5.3-flash" || efforts[0] != "max" {
+		t.Fatalf("default pick: model=%q effort=%q, want glm-5.3-flash/max", models[0], efforts[0])
+	}
+	if models[1] != "glm-5.3-flash" || efforts[1] != "max" {
+		t.Fatalf("override: model=%q effort=%q, want glm-5.3-flash/max (client value overwritten)", models[1], efforts[1])
+	}
+	if models[2] != "deepseek-v4-flash" || efforts[2] != "max" {
+		t.Fatalf("deepseek: model=%q effort=%q, want deepseek-v4-flash/max (group config beats high fallback)", models[2], efforts[2])
+	}
+}
+
+// TestChatGroupNoEffortNoInjection 组条目未配置档位时绝不注入 reasoning_effort
+//（非 deepseek 模型无缺档回退，出站 effort 应保持缺失——默认档由上游自决；
+// 实测上游对不认档位词的模型会把思考关掉）。
+func TestChatGroupNoEffortNoInjection(t *testing.T) {
+	up := newRecordUpstream(t)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := newGroupHandler(p, up.up, []modelgroup.Group{
+		{Name: "dev", Models: []string{"cn:glm-5.2"}},
+	})
+
+	if rec := postChat(h, "/dev/v1/chat/completions", `{"messages":[]}`); rec.Code != http.StatusOK {
+		t.Fatalf("default model: got %d, want 200", rec.Code)
+	}
+	_, models, efforts := up.snapshot()
+	if len(models) != 1 || models[0] != "glm-5.2" {
+		t.Fatalf("outbound model = %v, want [glm-5.2]", models)
+	}
+	if efforts[0] != "" {
+		t.Fatalf("unconfigured entry must NOT inject effort, got %q", efforts[0])
 	}
 }

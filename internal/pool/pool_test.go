@@ -1981,3 +1981,58 @@ func TestResumeIdempotent(t *testing.T) {
 		t.Errorf("Paused 应仍为 false: %+v", st)
 	}
 }
+
+// ---------- 成本观测池级共享 ----------
+
+// TestSharedModelCostTierDeMonopolizes 共享前：仅实测过的号是 tier 0，其余号被
+// 成本硬过滤挡在 tier 1，pick 恒选实测号（唯一 tier 0 假垄断）。共享后：限免/峰谷
+// 按模型全局生效，无观测号回退共享观测同为 tier 0，加权轮换恢复（两号都应中选）。
+func TestSharedModelCostTierDeMonopolizes(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 1000, 0)
+	p.SetCredits("u2", 1000, 0)
+	// 仅 u1 实测免费（credit=0 不扣余额）；u2 无任何观测。
+	p.NoteModelCost("u1", "m", 0, 1000)
+
+	seen := map[string]bool{}
+	for i := 0; i < 20; i++ {
+		a := p.PickExcludingForRealm(nil, "m", "")
+		if a == nil {
+			t.Fatal("tier 0 层应出票")
+		}
+		seen[a.UID] = true
+	}
+	if !seen["u2"] {
+		t.Fatalf("共享观测后 u2（无账号级观测）应同属 tier 0 参与轮换, seen=%v", seen)
+	}
+}
+
+// TestSharedModelCostFloorUsesSharedObservation floor 收费判据同样回退共享观测：
+// u1 实测收费、u2 无观测但触底 → u2 也应被拦（共享前 u2 走「无观测=放行」漏洞）。
+// 反向：共享观测为免费时触底号照常放行（floor 立足「留余额给免费模型」）。
+func TestSharedModelCostFloorUsesSharedObservation(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCreditFloor(100)
+	p.SetCredits("u1", 50, 0) // 触底（NoteModelCost 顺扣余额：50-3=47，仍触底）
+	p.SetCredits("u2", 50, 0) // 触底
+	// 仅 u1 实测收费；u2 无账号级观测。
+	p.NoteModelCost("u1", "m", 2.9, 1000)
+
+	// 共享后 u2 视同实测收费 → 两触底号全被 floor 拦下（共享前 u2 会走
+	// 「无观测=放行」漏洞成为唯一出票号）。
+	if a := p.PickExcludingForRealm(nil, "m", ""); a != nil {
+		t.Fatalf("触底号 + 共享收费观测应被 floor 全拦（池应无票）, got %v", a.UID)
+	}
+
+	// 免费放行用新模型验证（台账是 EMA 平滑，收费历史无法被单次 0 值观测清零）：
+	// u1 对 m2 首测免费 → 共享观测免费 → 触底的 u2 打 m2 照常出票。
+	p.NoteModelCost("u1", "m2", 0, 1000)
+	if a := p.PickExcludingForRealm(nil, "m2", ""); a == nil {
+		t.Fatal("共享免费观测下触底号应照常出票（免费模型不受 floor 限制）")
+	}
+}

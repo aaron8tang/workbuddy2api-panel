@@ -25,7 +25,12 @@ type Group struct {
 	// Name 组名，同时是 URL 路径段（/dev/v1/... 中的 "dev"）。
 	Name string `json:"name"`
 	// Models 组内模型（可为 "cn:glm-5.2" / "global:..." 带域前缀形态，判等按
-	// 裸名）。使用顺序 = 生效积分倍率升序（免费在前），倍率相同则按本清单顺序；
+	// 裸名）。可追加思考强度后缀 "cn:glm-5.3-flash|max"（SplitEffort 剥离）：
+	// 组路由对该模型的请求强制注入/覆盖请求体 reasoning_effort 字段（客户端
+	// 自带值也会被覆盖——组配置即开发基线）。档位词由上游按模型定义（实测
+	// glm-5.3-flash 仅认 "max"；显式传其不认的档位词会被上游处理为关思考，
+	// 因此只注入显式配置的值，未配置的模型绝不注入）。
+	// 使用顺序 = 生效积分倍率升序（免费在前），倍率相同则按本清单顺序；
 	// 空 = 组内不限模型。
 	Models []string `json:"models,omitempty"`
 	// Accounts 组内账号 UID 优先级（按序尝试）。空 = 跟随账号池既有规则选号。
@@ -37,9 +42,44 @@ type Group struct {
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 // reserved 组名保留字：与网关既有顶层路径段冲突，禁止用作组名。
+// "chat" 单列：server 的兜底分发器把 POST /chat/v1/... 视为非模型组请求直接 404
+//（见 server.groupDispatch 的排除段），留着会让"配置能存、路由却 404"两处口径打架，
+// 故在此一并禁掉，让校验在配置/面板保存期就报错。
 var reserved = map[string]bool{
 	"v1": true, "panel": true, "status": true, "healthz": true,
 	"static": true, "assets": true, "favicon.ico": true,
+	"chat": true,
+}
+
+// effortRe 思考强度档位词法：小写字母/数字开头，仅含小写字母、数字、-、_，
+// 长度 1-16。不硬编码档位表（档位词由上游按模型定义且持续演进，如 max/xhigh），
+// 只做词法兜底——真正「档位是否被该模型支持」只有上游能裁决（不支持时上游把
+// 思考关掉，见 Group.Models 注释），配置期拦不住。
+var effortRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,15}$`)
+
+// SplitEffort 拆分组内模型条目的思考强度后缀："cn:glm-5.3-flash|max" →
+// ("cn:glm-5.3-flash", "max")；无后缀 → (原串, "")。模型名不含 '|'，取最后一
+// 个 '|' 之后整段为档位（trim 空白；空后缀等同未配置）。
+func SplitEffort(entry string) (model, effort string) {
+	idx := strings.LastIndexByte(entry, '|')
+	if idx < 0 {
+		return entry, ""
+	}
+	eff := strings.TrimSpace(entry[idx+1:])
+	if eff == "" {
+		return entry[:idx], ""
+	}
+	return entry[:idx], eff
+}
+
+// EffortOf 返回 bare（裸模型名）在组内的思考强度配置；未配置或组不限模型返回 ""。
+func (g *Group) EffortOf(bare string) string {
+	for _, m := range g.Models {
+		if mm, eff := SplitEffort(m); eff != "" && BareOf(mm) == bare {
+			return eff
+		}
+	}
+	return ""
 }
 
 // ValidName 报告组名是否合法且未与既有路径冲突。
@@ -67,6 +107,13 @@ func Validate(groups []Group) error {
 		seen[g.Name] = true
 		g.Models = trimList(g.Models)
 		g.Accounts = trimList(g.Accounts)
+		for _, m := range g.Models {
+			if _, eff := SplitEffort(m); eff != "" && !effortRe.MatchString(eff) {
+				return fmt.Errorf("model_groups.groups[%d]: 模型 %q 的思考强度档位 %q 不合法"+
+					"（须为小写字母/数字开头，仅含小写字母、数字、-、_，长度 1-16，如 |max）",
+					i, m, eff)
+			}
+		}
 	}
 	return nil
 }
@@ -96,13 +143,14 @@ func BareOf(model string) string {
 	return model[idx+1:]
 }
 
-// Allows 报告 bare（裸模型名）是否属于组内模型白名单。白名单为空 = 不限。
+// Allows 报告 bare（裸模型名）是否属于组内模型白名单。白名单为空 = 不限；
+// 条目按 SplitEffort 剥思考强度后缀后判等。
 func (g *Group) Allows(bare string) bool {
 	if len(g.Models) == 0 {
 		return true
 	}
 	for _, m := range g.Models {
-		if BareOf(m) == bare {
+		if mm, _ := SplitEffort(m); BareOf(mm) == bare {
 			return true
 		}
 	}

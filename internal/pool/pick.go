@@ -97,8 +97,17 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// 若已知收费的号恒压过未知号，那台免费的号永远轮不到，也就永远学不到。
 	// 为什么用硬过滤而非仅排序：pickWeighted 会在候选内加权随机，只排序的话
 	// 收费号仍有机会抽中，达不到"优先免费"的语义。
+	// 成本观测池级共享（每 pick 只聚合一次）：限免/峰谷是上游**按模型全局生效**
+	// 的计费策略，不因账号而异——任一号的实测结论可代表全池。账号级观测仍优先
+	// （保留将来差异化定价的修正空间），本号无观测时回退共享值。
+	// 背景（issue：唯一 tier 0 假垄断）：共享前只有实测过的那个号是 tier 0，
+	// 其余号全被硬过滤挡在 tier 1，快过期 ×3 等加权对新会话完全失效。
+	shared, sharedOK := p.sharedModelCost(reqModel, now)
 	costTier := func(e *entry) (int, float64) {
 		mc, ok := e.modelCostOf(reqModel, now)
+		if !ok {
+			mc, ok = shared, sharedOK
+		}
 		if !ok {
 			return 1, 0
 		}
@@ -234,6 +243,30 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	return e.a
 }
 
+// sharedModelCost 池级共享成本观测：返回池内**任一账号**对该模型最近一次有效
+// 实测（按 LastSeen 取最新）。前提假设：同一上游服务的限免/峰谷等计费策略按
+// 模型全局生效，不因账号而异——一个号的实测结论可代表全池（costTier 硬分层与
+// floorBlockedForRealmModel 的收费判定均回退到此，账号级观测仍优先）。
+// 观测有效期沿用账号级口径（modelCostTTL），过期项不参与聚合。
+// 调用方必须已持有 p.mu（遍历 byUID 读各 entry 的 modelCost）。
+func (p *Pool) sharedModelCost(model string, now time.Time) (modelCostEntry, bool) {
+	if model == "" {
+		return modelCostEntry{}, false
+	}
+	var best modelCostEntry
+	found := false
+	for _, e := range p.byUID {
+		mc, ok := e.modelCostOf(model, now)
+		if !ok {
+			continue
+		}
+		if !found || mc.LastSeen.After(best.LastSeen) {
+			best, found = mc, true
+		}
+	}
+	return best, found
+}
+
 // floorBlockedForModel 积分保底拦截判定（pick 普通轮换与 PickByUIDForModel 粘性
 // 路径的单一事实来源）：floor>0 且账号触底（credits < floor）且该模型**收费**
 // 时为真。
@@ -267,8 +300,13 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 	if p.creditFloor <= 0 || model == "" || e.credits >= p.creditFloor {
 		return false
 	}
-	// 1) 本地实测台账：最权威（真实扣费证据）。
-	if mc, ok := e.modelCostOf(model, now); ok {
+	// 1) 本地实测台账：最权威（真实扣费证据）。本号无观测时回退池级共享观测
+	//    （限免/峰谷按模型全局生效，任一号的实测可代表全池）。
+	mc, ok := e.modelCostOf(model, now)
+	if !ok {
+		mc, ok = p.sharedModelCost(model, now)
+	}
+	if ok {
 		return mc.CostPer1k > 0
 	}
 	// 2) 上游目录倍率兜底：无实测观测时用牌价判收费，堵住「无观测 = 放行」漏洞。

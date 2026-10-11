@@ -1,0 +1,3 @@
+# Windows 下 core.autocrlf=true 会把工作区文本检出为 CRLF；
+# bash 脚本必须保持 LF，否则报 "\r: command not found"。
+*.sh text eol=lf

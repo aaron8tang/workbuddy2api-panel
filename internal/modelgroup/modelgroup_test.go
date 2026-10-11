@@ -26,6 +26,7 @@ func TestValidate(t *testing.T) {
 		{"empty name", []Group{{Name: " "}}},
 		{"reserved v1", []Group{{Name: "v1"}}},
 		{"reserved panel", []Group{{Name: "panel"}}},
+		{"reserved chat", []Group{{Name: "chat"}}},
 		{"uppercase", []Group{{Name: "Dev"}}},
 		{"bad char", []Group{{Name: "de v"}}},
 		{"leading dash", []Group{{Name: "-dev"}}},
@@ -41,11 +42,11 @@ func TestValidate(t *testing.T) {
 
 func TestBareOf(t *testing.T) {
 	cases := map[string]string{
-		"cn:glm-5.2":        "glm-5.2",
-		"global:gpt-x":      "gpt-x",
-		"glm-5.2":           "glm-5.2",
-		"other:model:x":     "other:model:x", // 非 cn/global 前缀视为裸名
-		"":                  "",
+		"cn:glm-5.2":    "glm-5.2",
+		"global:gpt-x":  "gpt-x",
+		"glm-5.2":       "glm-5.2",
+		"other:model:x": "other:model:x", // 非 cn/global 前缀视为裸名
+		"":              "",
 	}
 	for in, want := range cases {
 		if got := BareOf(in); got != want {
@@ -68,6 +69,61 @@ func TestAllows(t *testing.T) {
 	}
 }
 
+// TestSplitEffort 思考强度后缀剥离："模型|档位" → (模型, 档位)；无后缀/空档位
+// 原样返回空档位。
+func TestSplitEffort(t *testing.T) {
+	cases := []struct {
+		in     string
+		model  string
+		effort string
+	}{
+		{"cn:glm-5.3-flash|max", "cn:glm-5.3-flash", "max"},
+		{"glm-5.2", "glm-5.2", ""},
+		{"cn:glm-5.2|", "cn:glm-5.2", ""},             // 空档位 = 未配置
+		{"cn:glm-5.2| xhigh ", "cn:glm-5.2", "xhigh"}, // 档位 trim
+		{"cn:a|b|c", "cn:a|b", "c"},                   // 取最后一个 |
+		{"", "", ""},
+	}
+	for _, tc := range cases {
+		m, e := SplitEffort(tc.in)
+		if m != tc.model || e != tc.effort {
+			t.Errorf("SplitEffort(%q) = (%q, %q), want (%q, %q)", tc.in, m, e, tc.model, tc.effort)
+		}
+	}
+}
+
+// TestEffortOf 按裸名反查组内思考强度配置； Allows/EffortOf 均以后缀剥离后的
+// 裸名判等。
+func TestEffortOf(t *testing.T) {
+	g := Group{Name: "dev", Models: []string{"cn:glm-5.3-flash|max", "cn:deepseek-v4-flash"}}
+	if got := g.EffortOf("glm-5.3-flash"); got != "max" {
+		t.Errorf("EffortOf(glm-5.3-flash) = %q, want max", got)
+	}
+	if got := g.EffortOf("deepseek-v4-flash"); got != "" {
+		t.Errorf("EffortOf(unconfigured) = %q, want empty", got)
+	}
+	if got := g.EffortOf("kimi"); got != "" {
+		t.Errorf("EffortOf(non-member) = %q, want empty", got)
+	}
+	// 白名单判等不受后缀影响。
+	if !g.Allows("glm-5.3-flash") {
+		t.Error("Allows should strip effort suffix before matching")
+	}
+}
+
+// TestValidateEffortLexical 档位词法校验：小写字母/数字开头、仅小写字母数字-_、
+// 1-16 长度；大写/空格/超长拒绝（档位表本身由上游裁决，此处只拦词法错误）。
+func TestValidateEffortLexical(t *testing.T) {
+	if err := Validate([]Group{{Name: "dev", Models: []string{"cn:m|max", "cn:n|xhigh"}}}); err != nil {
+		t.Fatalf("valid efforts rejected: %v", err)
+	}
+	for _, bad := range []string{"cn:m|Max", "cn:m|hi gh", "cn:m|-low", "cn:m|" + string(make([]byte, 17))} {
+		if err := Validate([]Group{{Name: "dev", Models: []string{bad}}}); err == nil {
+			t.Errorf("effort %q: expected error, got nil", bad)
+		}
+	}
+}
+
 func TestRegistry(t *testing.T) {
 	var nilReg *Registry
 	if _, ok := nilReg.Lookup("dev"); ok {
@@ -86,6 +142,9 @@ func TestRegistry(t *testing.T) {
 	}
 	if _, ok := r.Lookup("v1"); ok {
 		t.Error("reserved name should never resolve even if injected")
+	}
+	if _, ok := r.Lookup("chat"); ok {
+		t.Error("reserved name chat should never resolve even if injected")
 	}
 	// Replace 热替换：旧组消失、新组可见（面板保存路径）。
 	r.Replace([]Group{{Name: "ops"}})
