@@ -130,14 +130,14 @@ func trimList(in []string) []string {
 }
 
 // BareOf 与 server.resolveModel 同一协议的镜像实现（server 包已 import 本包，
-// 不能反向依赖）：剥 "cn:" / "global:" 域前缀取裸模型名；其余形态原样返回。
+// 不能反向依赖）：剥 "cn:" / "global:" / "trae:" 前缀取裸模型名；其余形态原样返回。
 func BareOf(model string) string {
 	idx := strings.IndexByte(model, ':')
 	if idx < 0 {
 		return model
 	}
 	prefix := model[:idx]
-	if prefix != "cn" && prefix != "global" {
+	if prefix != "cn" && prefix != "global" && prefix != "trae" {
 		return model
 	}
 	return model[idx+1:]

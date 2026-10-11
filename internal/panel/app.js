@@ -339,7 +339,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', trae: 'TRAE 渠道', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -351,6 +351,7 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
+  if (v === 'trae') loadTrae();
   // 到期提醒卡片不再「打开账号池就自动查」：逐账号实时查上游，账号一多打开面板
   // 就卡死。数据只由卡片上的「检查」按钮显式触发；卡片初始隐藏。
   if (v === 'taskscenter') reattachQueueView();
@@ -830,8 +831,14 @@ function mgLines(taId) {
 // 模型来自模型目录缓存 mdAll（需先点上方「重新获取」拉一次）；账号来自池清单。
 function mgRenderChips() {
   const curM = mgLines('mgModels');
-  $('mgModelChips').innerHTML = mdAll.length
-    ? mdAll.slice(0, 80).map(m => {
+  // 前 80 条 + trae 条目补齐（trae 模型追加在目录尾部，截断可能切掉；
+  // 组编辑器需要能点选 trae: 前缀模型进组）。
+  const chipList = mdAll.slice(0, 80);
+  for (const m of mdAll.slice(80)) {
+    if (String(m.id || '').startsWith('trae:')) chipList.push(m);
+  }
+  $('mgModelChips').innerHTML = chipList.length
+    ? chipList.map(m => {
         const used = curM.includes(m.id);
         return '<span class="tag warn mg-chip' + (used ? ' used' : '') + '" data-mg-model="' + esc(m.id) +
           '" title="' + esc(m.name || m.id) + '">' + esc(m.id) + '</span>';
@@ -1339,6 +1346,199 @@ $('importFile').onchange = async () => {
   $('importFile').value = '';
 };
 
+/* ── TRAE 渠道 ────────────────────────────────────────────────────── */
+let traeLoginPending = null, traeLoginTimer = null;
+
+// 渠道关闭（Trae 未装配）时 /panel/api/trae/* 整组端点不注册 → 404，
+// 前端据此切到「未启用」提示，主面板视图零回归。
+function traeSetDisabledUI(off) {
+  $('traeDisabled').hidden = !off;
+  $('traeMain').hidden = off;
+}
+async function loadTrae(quiet) {
+  try {
+    const st = await api('trae/status');
+    traeSetDisabledUI(false);
+    $('traeNote').textContent = st.servable ? '渠道可服务' : '当前无可服务账号';
+    renderTraeAccounts(st.accounts || []);
+  } catch (e) {
+    if (String(e.message).includes('404')) { traeSetDisabledUI(true); return; }
+    if (!quiet) toast('读取 TRAE 渠道失败：' + e.message, 'err');
+  }
+}
+function renderTraeAccounts(list) {
+  const tb = $('traeBody');
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty"><div class="big">TRAE 账号是空的</div>点击右上角「Web 登录」添加一个 TRAE 账号，或粘贴回调链接导入凭证</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = list.map(s => {
+    let cls = '', tag;
+    if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
+    else if (s.cooling) { cls = 'cool'; tag = '<span class="tag warn">冷却中</span>'; }
+    else if (!s.enabled) { cls = 'off'; tag = '<span class="tag warn">已停用</span>'; }
+    else tag = '<span class="tag ok">可用</span>';
+    const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    const name = s.nickname ? esc(s.nickname) : '<span class="hint">未命名</span>';
+    const uidShort = s.uid.length > 12 ? s.uid.slice(0, 12) + '…' : s.uid;
+    const err = s.err_count ? ' · 连败 ' + s.err_count : '';
+    let exp = '—';
+    if (s.expires_at > 0) {
+      exp = new Date(s.expires_at * 1000).toLocaleString();
+      if (s.expired_soon) exp += ' <span class="tag warn">临近过期</span>';
+    }
+    // 积分到期：权益包 expire_time 明细（签到包=领取日+31天、月赠=月末清零）。
+    // 7 天内到期打标；"—" = 尚未刷新过积分明细（点「刷新」拉取）。
+    let cexp = '—';
+    if (s.credit_expires_at > 0) {
+      cexp = new Date(s.credit_expires_at * 1000).toLocaleString();
+      if (s.credit_expires_at * 1000 - Date.now() < 7 * 86400e3) cexp += ' <span class="tag warn">即将过期</span>';
+    }
+    const toggle = s.enabled
+      ? '<button class="xs" data-a="trae-off" data-u="' + esc(s.uid) + '">停用</button>'
+      : '<button class="xs" data-a="trae-on" data-u="' + esc(s.uid) + '">启用</button>';
+    return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
+      '<td class="mark" aria-hidden="true"><i></i></td>' +
+      '<td>' + name + '<div class="hint" style="font-size:11.5px;color:var(--ink-3)">' + esc(uidShort) + err + '</div>' + note + '</td>' +
+      '<td>' + tag + '</td>' +
+      '<td>' + s.credits + '</td>' +
+      '<td>' + cexp + '</td>' +
+      '<td>' + exp + '</td>' +
+      '<td class="c-acts">' + toggle +
+      '<button class="xs" data-a="trae-refresh" data-u="' + esc(s.uid) + '">刷新</button>' +
+      '<button class="xs" data-a="trae-credits" data-u="' + esc(s.uid) + '">查积分</button>' +
+      '<button class="xs ghost" data-a="trae-del" data-u="' + esc(s.uid) + '">移除</button></td>' +
+      '</tr>';
+  }).join('');
+}
+$('traeBody').onclick = async ev => {
+  const b = ev.target.closest('button[data-a]');
+  if (!b) return;
+  const uid = b.dataset.u, act = b.dataset.a;
+  const enc = encodeURIComponent(uid);
+  if (act === 'trae-on' || act === 'trae-off') {
+    b.disabled = true;
+    try {
+      await api('trae/accounts/' + enc, { method: 'PATCH', body: JSON.stringify({ enabled: act === 'trae-on' }) });
+      toast(act === 'trae-on' ? '已启用' : '已停用', 'ok');
+      loadTrae(true);
+    } catch (e) { toast('操作失败：' + e.message, 'err'); b.disabled = false; }
+    return;
+  }
+  if (act === 'trae-refresh') {
+    b.disabled = true; b.textContent = '刷新中…';
+    try {
+      await api('trae/accounts/' + enc + '/refresh', { method: 'POST' });
+      toast('Token 已刷新', 'ok');
+      loadTrae(true);
+    } catch (e) { toast('刷新失败：' + e.message, 'err'); }
+    finally { b.disabled = false; b.textContent = '刷新'; }
+    return;
+  }
+  if (act === 'trae-credits') {
+    b.disabled = true;
+    try {
+      const r = await api('trae/accounts/' + enc + '/credits', { method: 'POST' });
+      toast('剩余积分 ' + r.remain + (r.limit >= 0 ? ' / ' + r.limit : ''), 'ok');
+    } catch (e) { toast('查询失败：' + e.message, 'err'); }
+    finally { b.disabled = false; }
+    return;
+  }
+  if (act === 'trae-del') {
+    if (!confirm('移除 TRAE 账号 ' + uid + '？将删除 auths/ 下的凭证文件，不可恢复。')) return;
+    b.disabled = true;
+    try {
+      await api('trae/accounts/' + enc, { method: 'DELETE' });
+      toast('已移除', 'ok');
+      loadTrae(true);
+    } catch (e) { toast('移除失败：' + e.message, 'err'); b.disabled = false; }
+  }
+};
+
+/* Web 登录：生成回调端口登录链接 → 3s 轮询结果 → success 后刷新列表 */
+function traeSetLoginUI(on) {
+  $('traeLoginPad').hidden = !on;
+  $('btnTraeLogin').disabled = on;
+}
+function stopTraeLogin() { if (traeLoginTimer) { clearInterval(traeLoginTimer); traeLoginTimer = null; } }
+$('btnTraeLogin').onclick = async () => {
+  stopTraeLogin();
+  traeSetLoginUI(true);
+  $('traeLoginMsg').textContent = '正在生成登录链接…';
+  $('traeLoginUrl').textContent = '';
+  try {
+    const r = await api('trae/login', { method: 'POST', body: '{}' });
+    traeLoginPending = r.pending_id;
+    $('traeLoginMsg').textContent = '请在打开的页面完成 TRAE 登录，回调捕获后自动导入';
+    $('traeLoginUrl').textContent = r.login_url;
+    traeLoginTimer = setInterval(pollTraeLogin, 3000);
+  } catch (e) {
+    traeSetLoginUI(false);
+    toast('发起登录失败：' + e.message, 'err');
+  }
+};
+async function pollTraeLogin() {
+  if (!traeLoginPending) { stopTraeLogin(); return; }
+  try {
+    const r = await api('trae/login/result?pending_id=' + encodeURIComponent(traeLoginPending));
+    if (r.state === 'success' || r.state === 'failed' || r.state === 'canceled') {
+      stopTraeLogin();
+      traeSetLoginUI(false);
+      traeLoginPending = null;
+      if (r.state === 'success') { toast('TRAE 账号已添加：' + (r.nickname || r.uid), 'ok'); loadTrae(true); }
+      else if (r.state === 'failed') toast('登录失败：' + (r.error || '未知错误'), 'err');
+    }
+  } catch (e) {
+    // pending 过期/不存在（404）→ 结束轮询；瞬时网络错误 → 下轮再试
+    if (String(e.message).includes('404')) {
+      stopTraeLogin();
+      traeSetLoginUI(false);
+      traeLoginPending = null;
+      toast('登录会话已过期，请重试', 'err');
+    }
+  }
+}
+$('btnTraeCancelLogin').onclick = async () => {
+  if (traeLoginPending) {
+    try { await api('trae/login/cancel', { method: 'POST', body: JSON.stringify({ pending_id: traeLoginPending }) }); }
+    catch (e) { /* 会话可能已过期：忽略 */ }
+  }
+  stopTraeLogin();
+  traeSetLoginUI(false);
+  traeLoginPending = null;
+};
+$('btnTraeOpenUrl').onclick = () => open($('traeLoginUrl').textContent, '_blank');
+$('btnTraeCopyUrl').onclick = () => navigator.clipboard.writeText($('traeLoginUrl').textContent)
+  .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+
+/* 凭证导入：{ 开头当账号 JSON，否则当登录回调链接 */
+$('btnTraeImportToggle').onclick = () => { $('traeImportPad').hidden = !$('traeImportPad').hidden; };
+$('btnTraeImport').onclick = async () => {
+  const t = $('traeImportText').value.trim();
+  const note = $('traeImportNote');
+  if (!t) { note.textContent = '请先粘贴内容'; return; }
+  note.textContent = '导入中…';
+  try {
+    const body = t.startsWith('{') ? { json: t } : { callback_url: t };
+    const r = await api('trae/accounts/import', { method: 'POST', body: JSON.stringify(body) });
+    note.textContent = '';
+    $('traeImportText').value = '';
+    toast('已' + (r.action === 'updated' ? '更新' : '添加') + '账号 ' + (r.nickname || r.uid), 'ok');
+    loadTrae(true);
+  } catch (e) { note.textContent = '导入失败：' + e.message; }
+};
+
+/* 全量签到：异步执行，结果看运行日志 */
+$('btnTraeCheckin').onclick = async () => {
+  const b = $('btnTraeCheckin');
+  b.disabled = true;
+  try {
+    await api('trae/checkin', { method: 'POST' });
+    toast('签到已发起，结果见运行日志', 'ok');
+  } catch (e) { toast('签到发起失败：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
 $('btnRefresh').onclick = async () => {
@@ -1357,6 +1557,7 @@ $('btnRefresh').onclick = async () => {
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
+  else if (view === 'trae') loadTrae(true);
   else if (view === 'taskscenter') reattachQueueView();
 }
 function start() {

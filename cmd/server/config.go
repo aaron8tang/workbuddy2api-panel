@@ -14,6 +14,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelgroup"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/upstream"
 )
 
 // Config 顶层配置。
@@ -222,6 +223,49 @@ type Config struct {
 		Groups []modelgroup.Group `json:"groups"`
 	} `json:"model_groups"`
 
+	// Trae TRAE SOLO 渠道段（阶段 2b 彻底合并）：独立账号池/上游/调度器，
+	// 由主路由按 "trae:" 模型前缀分发。缺省无账号 → 完全不参与服务（零回归）。
+	Trae struct {
+		// Enabled trae 渠道总开关，缺省 true。无账号时渠道天然不服务（Servable=false、
+		// /v1/models 不追加 trae 条目），显式 false 是逃生门（连调度器/回调监听都不起）。
+		Enabled bool `json:"enabled"`
+		// AuthDir trae 凭证目录（trae-*.json）；空 = 跟随顶层 auth_dir（与 workbuddy
+		// 凭证共存：workbuddy 只 glob workbuddy*.json，trae 只 glob trae-*.json，互不干扰）。
+		AuthDir string `json:"auth_dir"`
+		// StateFile trae 账号池状态文件（签到/积分/冷却缓存）；默认 ./data/trae_state.json。
+		StateFile string `json:"state_file"`
+		// CallbackPort Web 登录回调独立监听端口（127.0.0.1:port/authorize），默认 "18080"；
+		// "0" = 不起独立 listener（Web 登录不可用，仅剩粘贴回调链接导入）。
+		CallbackPort string `json:"callback_port"`
+		// CheckinHour 每日签到小时（0-23），默认 9。
+		CheckinHour int `json:"checkin_hour"`
+		// RefreshHours token 预刷新小时列表，默认 [3]。
+		RefreshHours []int `json:"refresh_hours"`
+		// RefreshSkew token 过期前预刷新窗口，默认 "24h"。
+		RefreshSkew string `json:"refresh_skew"`
+		// MaxRotate 单请求最多换号次数，默认 3。
+		MaxRotate int `json:"max_rotate"`
+		// PlanCooldown 1005 套餐限额冷却，默认 "12h"。
+		PlanCooldown string `json:"plan_cooldown"`
+		// SoftCooldown 429 软限流冷却，默认 "60s"。
+		SoftCooldown string `json:"soft_cooldown"`
+		// ErrThreshold 连续错误熔断阈值，默认 3。
+		ErrThreshold int `json:"err_threshold"`
+		// ErrCooldown 错误熔断冷却，默认 "10m"。
+		ErrCooldown string `json:"err_cooldown"`
+		// DefaultModel model 缺省/"default" 时的 SOLO 模型，默认 glm-5.2。
+		DefaultModel string `json:"default_model"`
+		// WorkMode Work 通道模式：auto（默认，Native 失败降级 Bridge）/ native / bridge / disabled。
+		WorkMode string `json:"work_mode"`
+		// WorkBridgeURL/WorkBridgeToken 外部 Bridge 地址与令牌（work_mode=bridge 时必填）。
+		WorkBridgeURL   string `json:"work_bridge_url"`
+		WorkBridgeToken string `json:"work_bridge_token"`
+		// CreditResetDay trae 积分月度重置日（1-28），默认 1。上游不提供积分周期
+		// 数据，模型组跨渠道「谁先到期用谁」排序按该日估算到期时刻；0 = 关闭估算
+		//（trae 渠道到期信号视为未知，default 排序退化为倍率序）。
+		CreditResetDay int `json:"credit_reset_day"`
+	} `json:"trae"`
+
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
@@ -237,6 +281,12 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// Trae 段解析后的时长（NormalizeTrae 填充）。
+	TraeRefreshSkewDur    time.Duration `json:"-"`
+	TraePlanCooldownDur   time.Duration `json:"-"`
+	TraeSoftCooldownDur   time.Duration `json:"-"`
+	TraeErrCooldownDur    time.Duration `json:"-"`
+	TraeWorkMode          upstream.WorkMode `json:"-"` // 解析后的 Work 通道模式
 }
 
 // Default 默认配置。
@@ -302,6 +352,21 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// Trae 渠道缺省值：开关默认开（无账号即天然不服务）；端口/排程/冷却对齐 trae2api 默认。
+	c.Trae.Enabled = true
+	c.Trae.StateFile = "./data/trae_state.json"
+	c.Trae.CallbackPort = "18080"
+	c.Trae.CheckinHour = 9
+	c.Trae.RefreshHours = []int{3}
+	c.Trae.RefreshSkew = "24h"
+	c.Trae.MaxRotate = 3
+	c.Trae.PlanCooldown = "12h"
+	c.Trae.SoftCooldown = "60s"
+	c.Trae.ErrThreshold = 3
+	c.Trae.ErrCooldown = "10m"
+	c.Trae.DefaultModel = "glm-5.2"
+	c.Trae.WorkMode = "auto"
+	c.Trae.CreditResetDay = 1
 	return c
 }
 
@@ -607,7 +672,81 @@ func (c *Config) normalize() error {
 	if err := modelgroup.Validate(c.ModelGroups.Groups); err != nil {
 		return err
 	}
-	return c.normalizePrompt()
+	if err := c.normalizePrompt(); err != nil {
+		return err
+	}
+	return c.normalizeTrae()
+}
+
+// normalizeTrae trae 渠道段归一化：空值回落默认、时长解析 fail fast、
+// 小时范围与 work_mode 枚举校验（风格同 validateScheduleHours）。
+func (c *Config) normalizeTrae() error {
+	if c.Trae.StateFile == "" {
+		c.Trae.StateFile = "./data/trae_state.json"
+	}
+	if c.Trae.CallbackPort == "" {
+		c.Trae.CallbackPort = "18080"
+	}
+	if len(c.Trae.RefreshHours) == 0 {
+		c.Trae.RefreshHours = []int{3}
+	}
+	if c.Trae.CheckinHour < 0 || c.Trae.CheckinHour > 23 {
+		return fmt.Errorf("trae.checkin_hour: %d 不是合法小时（0-23）", c.Trae.CheckinHour)
+	}
+	for _, h := range c.Trae.RefreshHours {
+		if h < 0 || h > 23 {
+			return fmt.Errorf("trae.refresh_hours: %d 不是合法小时（0-23）", h)
+		}
+	}
+	if c.Trae.RefreshSkew == "" {
+		c.Trae.RefreshSkew = "24h"
+	}
+	dur, err := time.ParseDuration(c.Trae.RefreshSkew)
+	if err != nil || dur <= 0 {
+		return fmt.Errorf("trae.refresh_skew: %q 不是合法正时长", c.Trae.RefreshSkew)
+	}
+	c.TraeRefreshSkewDur = dur
+	if c.Trae.PlanCooldown == "" {
+		c.Trae.PlanCooldown = "12h"
+	}
+	if c.TraePlanCooldownDur, err = time.ParseDuration(c.Trae.PlanCooldown); err != nil {
+		return fmt.Errorf("trae.plan_cooldown: %w", err)
+	}
+	if c.Trae.SoftCooldown == "" {
+		c.Trae.SoftCooldown = "60s"
+	}
+	if c.TraeSoftCooldownDur, err = time.ParseDuration(c.Trae.SoftCooldown); err != nil {
+		return fmt.Errorf("trae.soft_cooldown: %w", err)
+	}
+	if c.Trae.ErrCooldown == "" {
+		c.Trae.ErrCooldown = "10m"
+	}
+	if c.TraeErrCooldownDur, err = time.ParseDuration(c.Trae.ErrCooldown); err != nil {
+		return fmt.Errorf("trae.err_cooldown: %w", err)
+	}
+	if c.Trae.ErrThreshold <= 0 {
+		c.Trae.ErrThreshold = 3
+	}
+	if c.Trae.MaxRotate <= 0 {
+		c.Trae.MaxRotate = 3
+	}
+	// CreditResetDay：0 = 显式关闭到期估算（合法）；1-28 合法；其余 fail fast。
+	if c.Trae.CreditResetDay < 0 || c.Trae.CreditResetDay > 28 {
+		return fmt.Errorf("trae.credit_reset_day: %d 不是合法日期（0 关闭 / 1-28）", c.Trae.CreditResetDay)
+	}
+	switch m := strings.ToLower(strings.TrimSpace(c.Trae.WorkMode)); m {
+	case "", "auto":
+		c.TraeWorkMode = upstream.WorkModeAuto
+	case "native":
+		c.TraeWorkMode = upstream.WorkModeNative
+	case "bridge":
+		c.TraeWorkMode = upstream.WorkModeBridge
+	case "disabled":
+		c.TraeWorkMode = upstream.WorkModeDisabled
+	default:
+		return fmt.Errorf("trae.work_mode: %q 不是合法值（auto / native / bridge / disabled）", c.Trae.WorkMode)
+	}
+	return nil
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。

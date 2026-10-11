@@ -27,6 +27,11 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
+	traeauth "github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
+	traepool "github.com/linguo2625469/workbuddy2api-panel/internal/trae/pool"
+	traescheduler "github.com/linguo2625469/workbuddy2api-panel/internal/trae/scheduler"
+	traeupstream "github.com/linguo2625469/workbuddy2api-panel/internal/trae/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -171,6 +176,64 @@ func main() {
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
 
+	// ---------------------------------------------------------------------------
+	// trae 渠道（阶段 2b 彻底合并）：独立账号池 / 上游客户端 / 调度器 / 回调监听。
+	// Enabled=false 或无账号时渠道不参与服务（Servable=false、models 不追加条目、
+	// handler Trae 为 nil），workbuddy 主链路零回归。
+	// ---------------------------------------------------------------------------
+	var traeGw *trae.Gateway
+	var traeSched *traescheduler.Scheduler
+	if cfg.Trae.Enabled {
+		traeAuthDir := cfg.Trae.AuthDir
+		if traeAuthDir == "" {
+			traeAuthDir = cfg.AuthDir // 空 = 跟随顶层 auth_dir（workbuddy*.json 与 trae-*.json glob 互不相交）
+		}
+		migrateTraeLegacy(traeAuthDir, cfg.Trae.StateFile)
+
+		traeAuths, err := traeauth.LoadDir(traeAuthDir)
+		if err != nil {
+			log.Fatalf("load trae auths: %v", err)
+		}
+		tp := traepool.New(cfg.Trae.StateFile)
+		tp.SyncToDir(traeAuths) // 与 trae-*.json 对齐：加入新账号、剔除已删文件账号（状态保留）
+
+		tu := traeupstream.New()
+		traeGw = trae.New(trae.Config{
+			Pool:            tp,
+			Upstream:        tu,
+			AuthDir:         traeAuthDir,
+			MaxRotate:       cfg.Trae.MaxRotate,
+			PlanCooldown:    cfg.TraePlanCooldownDur,
+			SoftCooldown:    cfg.TraeSoftCooldownDur,
+			ErrThreshold:    cfg.Trae.ErrThreshold,
+			ErrCooldown:     cfg.TraeErrCooldownDur,
+			RefreshSkew:     cfg.TraeRefreshSkewDur,
+			DefaultModel:    cfg.Trae.DefaultModel,
+			WorkBridgeURL:   cfg.Trae.WorkBridgeURL,
+			WorkBridgeToken: cfg.Trae.WorkBridgeToken,
+			WorkMode:        cfg.TraeWorkMode,
+			CreditResetDay:  cfg.Trae.CreditResetDay,
+		})
+		traeSched = traescheduler.New(traescheduler.Config{
+			Pool:         tp,
+			Upstream:     tu,
+			CheckinHour:  cfg.Trae.CheckinHour,
+			RefreshHours: cfg.Trae.RefreshHours,
+			RefreshSkew:  cfg.TraeRefreshSkewDur,
+		})
+		traeGw.SetScheduler(traeSched)
+		traeGw.SetCallbackPort(cfg.Trae.CallbackPort)
+		traeGw.StartCallbackServer(cfg.Trae.CallbackPort)
+
+		switch {
+		case len(traeAuths) == 0:
+			log.Printf("[trae] 渠道已启用但暂无账号（%s 下无 trae-*.json）：面板登录/导入后即生效", traeAuthDir)
+		default:
+			log.Printf("[trae] 渠道已启用：%d 个账号（模型以 trae: 前缀暴露，回调监听 :%s）",
+				len(traeAuths), cfg.Trae.CallbackPort)
+		}
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
@@ -289,6 +352,8 @@ func main() {
 		// 模型组注册表：面板「模型与档位 → 模型组」在线编辑后经 SaveConfig 热替换
 		//（路由 pattern 是通配 {group} 段，组存在性在请求期查表，无需重启）。
 		ModelGroups: mgr,
+		// trae 渠道门面（nil = 渠道关闭：/panel/api/trae/* 不注册）。
+		Trae: traeGw,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -327,11 +392,18 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型组注册表（/{group}/v1/* 路由的请求期查表；面板保存后热替换）。
 		ModelGroups: mgr,
+		// trae 渠道门面（nil = 渠道关闭：trae: 模型前缀恒 404，零回归）。
+		Trae: traeGw,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// trae 调度：主排程（签到/token 预刷新）+ 9074 签到退避重试循环。
+	if traeSched != nil {
+		go traeSched.Run(ctx)
+		go traeSched.RetryLoop(ctx, 15*time.Minute)
+	}
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
@@ -554,7 +626,71 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
+	// trae 渠道的池/上游/调度器/回调监听都是装配期对象，暂不支持热替换；
+	// 深合并保证 trae 段保存不丢失，重启后生效。
+	out = append(out, "trae.enabled", "trae.auth_dir", "trae.state_file", "trae.callback_port",
+		"trae.checkin_hour", "trae.refresh_hours", "trae.refresh_skew", "trae.max_rotate",
+		"trae.plan_cooldown", "trae.soft_cooldown", "trae.err_threshold", "trae.err_cooldown",
+		"trae.default_model", "trae.work_mode", "trae.work_bridge_url", "trae.work_bridge_token",
+		"trae.credit_reset_day")
 	return out
+}
+
+// migrateTraeLegacy 一次性迁移旧 trae2api 独立部署的数据（阶段 2b 合并适配）：
+//   - 池状态：目标 state 文件不存在且旧部署 data/state.json 存在 → 复制过来
+//   - 凭证：trae auth 目录无 trae-*.json 且旧部署 auths/trae-*.json 存在 → 逐个复制
+//
+// 只在目标缺失时执行（幂等）；旧路径按兄弟目录 trae2api 探测（../trae2api 与
+// ./trae2api），失败仅记日志不阻塞启动。
+func migrateTraeLegacy(authDir, stateFile string) {
+	legacyRoots := []string{"../trae2api", "trae2api"}
+	if _, err := os.Stat(stateFile); err != nil {
+		for _, root := range legacyRoots {
+			raw, err := os.ReadFile(filepath.Join(root, "data", "state.json"))
+			if err != nil {
+				continue
+			}
+			if mkErr := os.MkdirAll(filepath.Dir(stateFile), 0o755); mkErr != nil {
+				log.Printf("[trae] 迁移池状态失败（mkdir）: %v", mkErr)
+				break
+			}
+			if wErr := os.WriteFile(stateFile, raw, 0o600); wErr == nil {
+				log.Printf("[trae] 已从旧部署迁移池状态 %s → %s", filepath.Join(root, "data", "state.json"), stateFile)
+			} else {
+				log.Printf("[trae] 迁移池状态失败: %v", wErr)
+			}
+			break
+		}
+	}
+	own, _ := filepath.Glob(filepath.Join(authDir, "trae-*.json"))
+	if len(own) > 0 {
+		return
+	}
+	for _, root := range legacyRoots {
+		legacy, err := filepath.Glob(filepath.Join(root, "auths", "trae-*.json"))
+		if err != nil || len(legacy) == 0 {
+			continue
+		}
+		if mkErr := os.MkdirAll(authDir, 0o755); mkErr != nil {
+			log.Printf("[trae] 迁移凭证失败（mkdir）: %v", mkErr)
+			break
+		}
+		n := 0
+		for _, src := range legacy {
+			raw, err := os.ReadFile(src)
+			if err != nil {
+				continue
+			}
+			dst := filepath.Join(authDir, filepath.Base(src))
+			if os.WriteFile(dst, raw, 0o600) == nil {
+				n++
+			}
+		}
+		if n > 0 {
+			log.Printf("[trae] 已从旧部署迁移 %d 个凭证 → %s", n, authDir)
+		}
+		break
+	}
 }
 
 // mergeConfigMaps 把 incoming 深合并进 cur（原地），返回 cur。

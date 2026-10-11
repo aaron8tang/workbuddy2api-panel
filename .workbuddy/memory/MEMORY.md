@@ -2,7 +2,7 @@
 
 ## 项目概况
 - Go 语言 AI 网关 + 管理面板：OpenAI 兼容 API（/v1/chat/completions、/v1/models）+ 内嵌 Web 面板（/panel/）。
-- 入口 `cmd/server`，核心包：internal/server（HTTP）、internal/pool（账号池选号）、internal/upstream（上游）、internal/scheduler（定时任务）、internal/panel（面板）、internal/modelgroup（模型组，2026-10-06 新增）。
+- 入口 `cmd/server`，核心包：internal/server（HTTP）、internal/pool（账号池选号）、internal/upstream（上游）、internal/scheduler（定时任务）、internal/panel（面板）、internal/modelgroup（模型组，2026-10-06 新增）、**internal/trae（TRAE SOLO 渠道子系统，2026-10-11 阶段 2b 自 trae2api 彻底合并：根包 gateway/engine/chat/callback/login + auth/ pool/ upstream/ scheduler/ 四子包）**。
 - 监听 :7863，config.json（由 config.example.json 复制，api_key=test_key），凭证落盘 auths/，状态落盘 data/（state.json、usage.json、request-logs/ JSONL 归档）。
 - 版本 appVersion="1.12.0-panel"；路由：/healthz（无可用账号 503）、/panel/、/status、/v1/*；模型组形态 /{组名}/v1（主）+ /v1/{组名}（别名）。
 
@@ -30,6 +30,9 @@
 - 组名保留字：internal/modelgroup/modelgroup.go 的 `reserved` = v1/panel/status/healthz/static/assets/favicon.ico/**chat**。`chat` 单列是因为 server 兜底分发器把它当非模型组请求直接 404，禁掉以对齐两处口径（2026-10-07）。
 - 面板配置热生效走 saveConfig 深合并 + 各组件 Set/Replace；模型组为 Registry.Replace。
 - rewriteModel 对 body 缺 model 字段时不注入，需要强制写入时用 setModelField。
+- **trae 渠道分发协议（2026-10-11 阶段 2b）**：resolveModel 第三 realm `"trae"`（`trae:` 前缀模型）；chatCompletions 在 st.done 后、sticky 前整体移交 `trae.Gateway.ChatCompletions`，分发前回填 r.Body（body 已被组裁决改写）+ `st.logged=true` 抑制外层表格行（trae 有自己的 `| trae # |` 行）。Trae==nil（trae.enabled=false 或未装配）→ trae: 前缀恒 404、models 不追加、/panel/api/trae/* 不注册、healthz trae=false，主链路零回归。
+- trae 渠道关键配置：auth 共享目录（workbuddy glob `workbuddy*.json`、trae glob `trae-*.json`，trae.auth_dir 空=跟随顶层）；旧独立部署一次性迁移 migrateTraeLegacy（探测 `../trae2api`、`./trae2api`，复制 state+auths，幂等）；16 个 `trae.*` 字段全在 restartRequiredFields（装配期对象不可热替换）；model=default 语义对 trae 条目同样适用（Trae==nil 时跳过该条目）。
+- trae 登录回调监听绑 `:18080` 全网卡（非 127.0.0.1）——容器内 Web 登录依赖 docker-proxy 映射，绑 loopback 会静默失效；compose 已加 "18080:18080"（不做 Web 登录可删）。
 
 ## 选号与路由机制（排障必读）
 所有选号逻辑集中在 `internal/pool/pick.go` 的 `pick(tried, reqModel, realm)`，**两级路径，优先级不同**：
@@ -57,7 +60,9 @@
 ## 测试与环境坑
 - handler 测试：TestModelsGrouped 会污染全局 dynamicModelsCache 负缓存，需 resetModelsCache。
 - GET 请求 req.Body 可能为 nil，测试构造时需注意。
-- 本机沙箱：internal/scheduler 与 internal/upstream 部分绑真实 listener 的测试会挂起（TestRunActivityNowReportsEachAccount 等），跑测试只跑 internal/server 与 internal/modelgroup。
+- 本机沙箱：internal/scheduler 与 internal/upstream 部分绑真实 listener 的测试会挂起（TestRunActivityNowReportsEachAccount 等），跑测试只跑 internal/server 与 internal/modelgroup。**internal/trae 各包测试不挂**（已统一改 RoundTripper stub 注入，不绑端口不触网），全量回归可跑：`go test $(go list ./... | Where-Object { $_ -notmatch 'internal/(scheduler|upstream)$' })`（PowerShell）。
+- **PowerShell 5.1 `Set-Content -Encoding utf8` 写 BOM → Go json.Unmarshal `invalid character '\ufeff'` fatal**；写 UTF-8 用 `[System.IO.File]::WriteAllText(path, raw, (New-Object System.Text.UTF8Encoding($false)))`。Write 工具产物也可能带 BOM，喂给程序的文件先查前 3 字节。
+- 改 normalize() 链式校验返回链时不得把 `return a()` 直接替换成 `return b()`（曾丢失 normalizePrompt 校验，被 config_test 拦下）。
 - 面板测试文件输出写到项目目录内（/tmp 有时不通）。
 - PowerShell 内联 JSON 会被吞双引号：写文件后 `-d "@body.json"`，或 cmd.exe 中转义 `\"`。
 - API Key 为 test_key（下划线），写 test-key 报 invalid_api_key。
@@ -68,7 +73,8 @@
 - 客户端常见"connection error"排查顺序：① base 与工具的 /v1 拼接规则是否匹配（`/chat2/v1/v1/...`、尾斜杠、`/messages` 均 404，网关只实现 OpenAI 形态）② API Key 是否填对 ③ 是否浏览器内核（CORS）④ 是否 IPv6 回环。
 - cmd.exe 不认单引号：`curl -d '{"k":"v"}'` 会把 `'` 原样发出 → 上游 11101 `invalid character '\''`（网关原样透传上游错误）。cmd 用外层双引号 + 内层 `\"`，或 `--data-binary @file`（UTF-8 无 BOM，避开 GBK 乱码）。
 
-## 运行状态（2026-10-11 07:46 实测）
+## 运行状态（2026-10-11 07:46 实测；18:0x trae 合并进展见下）
+- **trae 阶段 2b 合并已完成（2026-10-11 晚）**：internal/trae 子系统 + 分发边界 + 面板 TRAE 渠道视图 + config trae 段 + Docker(18080) + 95 个移植测试全绿 + 冒烟通过（enabled：status 200/chat 503 无账号；disabled：双 404）。**代码未提交、未构建新镜像**；当前容器跑的仍是旧镜像（无 trae 渠道）。D:\projects\trae2api 独立项目保留作参考，其 data/auths 会在新 binary 首启时经 migrateTraeLegacy 自动迁移。
 - 服务以 **docker 容器（本地构建镜像 workbuddy2api-panel:local）** 运行中（:7863，healthy）；**账号池 6/6 healthy**：柒佰纳米62d9622b / jiujiu 8400b9b6 / 15711405270 89eb6478 / 陈九川 a9df9de4 / **cookman b020e710（新，49361 积分）** / airwa fcff07d7。cn 域可服务、global 不可服务。**wb2api.exe 未运行**（与容器争 7863，只能起一个）。
 - 模型组 dev 已在 config.json 落盘并生效（hy4-preview/space-bunny/glm-5.3-flash/deepseek-v4.1-flash/deepseek-v4-flash，accounts 空跟随池）。
 - dev 组实测使用顺序：space-bunny → glm-5.3-flash → deepseek-v4.1-flash → deepseek-v4-flash → hy4-preview（末位=当前动态目录其倍率未知；生效后免费模型自动排最前）。
@@ -87,6 +93,8 @@
 - 排障请求落在哪个号：`data/request-logs/requests-YYYY-MM-DD.jsonl`（字段：time/request_id/path/**account**/model/status/duration_ms/ttfb_ms/attempts/tokens/client_ip/user_agent），配 `python -c` 按 account 聚合计数最快。**注意先看 `path` 字段确认真实走的路由**（`/v1/...` 还是 `/dev/v1/...`）。
 
 ## 待办
+- **提交 trae 阶段 2b 合并改动并重建容器**（internal/trae 子树 + server/panel/main/config 接入 + Dockerfile/compose + config.example.json + 测试，全部未提交）；更新流程照旧：`update-docker.bat`（构建→删旧容器→起新容器→健康探测，数据挂载天然保留）。重建后 healthz 应含 `"trae":false`（realm 已注册、无账号）。
+- **trae 渠道真实账号端到端验证**：面板「TRAE 渠道」Web 登录（容器需 18080 映射）或粘贴回调链接导入 → 查积分/签到 → `trae:glm-5.2` 聊天冒烟；顺带验证 migrateTraeLegacy 对 D:\projects\trae2api 旧数据的迁移。
 - **客户端 base_url 实际配的是 `http://127.0.0.1:7863/v1`（主路由），不是 `/dev/v1`** —— request-logs 证实当日 15 条全是 `/v1/chat/completions`。若要真正走模型组路由须改 base_url（两者共用账号池规则，行为一致但路由不同）。待用户确认客户端配置。
 - **「按临近度分档加权」待用户决策**：expiring_soon 已收窄为 48h，但窗口内一刀切 ×3（airwa 2h 后到期与陈九川 17.6h 后到期权重仍近乎并列）。要「越临期越优先」需改权重公式（如 <6h ×5 / <24h ×3 / <48h ×2）。
 - config.json 的 api_key 由示例值 test_key 换成强密钥（公网必须 HTTPS 反代 + 强密钥，服务无内置 TLS）。

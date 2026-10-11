@@ -18,6 +18,10 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelgroup"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
+	traeauth "github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
+	traepool "github.com/linguo2625469/workbuddy2api-panel/internal/trae/pool"
+	traeupstream "github.com/linguo2625469/workbuddy2api-panel/internal/trae/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -217,6 +221,177 @@ func TestChatGroupAccountPinnedNoFallback(t *testing.T) {
 	tokens, _, _ := up.snapshot()
 	if len(tokens) != 0 {
 		t.Fatalf("no upstream call expected, got %v", tokens)
+	}
+}
+
+// TestChatGroupTraeEntries 组内 trae: 前缀条目（阶段 2b 合并）：
+//   - 渠道关闭（Trae==nil）：model=default 跳过 trae 条目、回落组内 workbuddy 模型
+//     （default 不落在不可服务渠道上）；点名 trae: 模型过组白名单（裸名判等）后
+//     按渠道关闭 404。
+//   - 渠道开启但无可服务账号：default 跳过 trae 条目回落 cn（到期序会让 trae 频繁
+//     排前，Servable 门控保证 trae 全冷却时不卡死 default）；点名 trae: 模型仍整体
+//     分发进 trae 网关 → 503 no_healthy_account（渠道状态如实透传）。
+func TestChatGroupTraeEntries(t *testing.T) {
+	up := newRecordUpstream(t)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	groups := []modelgroup.Group{
+		// trae 条目写在最前：两模型倍率均未知（假上游无目录）→ 倍率次序退化书写顺序，
+		// 覆盖「default 命中 trae 条目」与「跳过 trae 回落 cn 条目」两条路径。
+		{Name: "dev", Models: []string{"trae:glm-5.2", "cn:glm-5.2"}},
+	}
+
+	// 渠道关闭：default 回落 cn 条目（跳过 trae），出站 model 为裸名。
+	h := newGroupHandler(p, up.up, groups)
+	rec := postChat(h, "/dev/v1/chat/completions", `{"model":"default","messages":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default with trae disabled: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	_, models, _ := up.snapshot()
+	if len(models) != 1 || models[0] != "glm-5.2" {
+		t.Fatalf("default should fall back to cn entry (skip trae), outbound models = %v", models)
+	}
+
+	// 渠道关闭：点名 trae: 模型 → 404 unknown_model（主链路零回归语义）。
+	rec = postChat(h, "/dev/v1/chat/completions", `{"model":"trae:glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("explicit trae model with channel disabled: got %d, want 404 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// 渠道开启但无账号：default 跳过 trae 回落 cn 条目 → 200。
+	tp := traepool.New("")
+	h2 := NewHandler(Config{
+		Pool:        p,
+		Upstream:    up.up,
+		ModelGroups: modelgroup.NewRegistry(groups),
+		Trae:        trae.New(trae.Config{Pool: tp, Upstream: traeupstream.New(), WorkMode: "disabled"}),
+	})
+	rec = postChat(h2, "/dev/v1/chat/completions", `{"model":"default","messages":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default with trae unservable: got %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if _, models, _ = up.snapshot(); len(models) != 2 || models[1] != "glm-5.2" {
+		t.Fatalf("default should skip unservable trae entry, outbound models = %v", models)
+	}
+
+	// 点名 trae: 模型仍整体分发进 trae 网关 → 503 no_healthy_account。
+	rec = postChat(h2, "/dev/v1/chat/completions", `{"model":"trae:glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("explicit trae model: got %d, want 503 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "no_healthy_account") {
+		t.Fatalf("expect trae gateway error no_healthy_account, got %s", rec.Body.String())
+	}
+}
+
+// TestChatGroupDefaultFallsToTraeWhenPoolEmpty 主池 cn 域无健康账号（用户全停
+// workbuddy 账号、只留 trae 渠道）时，model=default / 缺省应跳过全部 cn 条目、
+// 落到组内 trae 条目并整体分发进 trae 网关（组内多渠道容灾）——而不是选中 cn
+// 模型后在主池报 no_healthy_account。trae 网关持有健康账号（Servable=true），
+// 上游指向本地假服务器（恒 500）→ 网关轮转耗尽后如实报错，零真实网络。
+func TestChatGroupDefaultFallsToTraeWhenPoolEmpty(t *testing.T) {
+	up := newRecordUpstream(t)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.Disable("u1", "stopped by user")
+	groups := []modelgroup.Group{
+		// cn 条目倍率已知（假上游目录）排前、trae 条目倍率未知排最后——覆盖
+		//「优先级靠前的 cn 条目全被渠道可服务性跳过后 default 落到末位 trae 条目」。
+		{Name: "dev", Models: []string{"cn:glm-5.2", "trae:glm-5.2"}},
+	}
+	// trae 假上游：RoundTripper 注入恒 500（不起真实 listener，本机沙箱绑端口
+	// 会挂死），让网关自己走轮转/冷却状态机后报 no_healthy_account。
+	tu := traeupstream.New()
+	fakeTrae := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"message":"internal error"}`)),
+		}, nil
+	})}
+	tu.HTTP = fakeTrae
+	tu.StreamHTTP = fakeTrae
+	tp := traepool.New("")
+	tp.Add(&traeauth.Auth{UID: "t1", AccessToken: "tat", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool:        p,
+		Upstream:    up.up,
+		ModelGroups: modelgroup.NewRegistry(groups),
+		Trae:        trae.New(trae.Config{Pool: tp, Upstream: tu, WorkMode: "disabled"}),
+	})
+
+	for _, body := range []string{
+		`{"messages":[]}`,                   // model 缺省
+		`{"model":"default","messages":[]}`, // model = "default"
+	} {
+		rec := postChat(h, "/dev/v1/chat/completions", body)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("body %s: got %d, want 503 (body: %s)", body, rec.Code, rec.Body.String())
+		}
+		// 错误必须来自 trae 网关（无 gateway_hint），而非主池（主池 503 带
+		// gateway_hint "no healthy account available in pool"）——证明 default
+		// 确实分发进了 trae 渠道而不是留在主链路。
+		if strings.Contains(rec.Body.String(), "gateway_hint") {
+			t.Fatalf("body %s: default should dispatch to trae gateway, got main-pool error: %s", body, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "no_healthy_account") {
+			t.Fatalf("body %s: expect trae gateway error no_healthy_account, got %s", body, rec.Body.String())
+		}
+	}
+	// 主链路不应有任何出站调用（cn 账号已全停，default 也不该选中 cn 模型）。
+	if tokens, _, _ := up.snapshot(); len(tokens) != 0 {
+		t.Fatalf("no main-pool outbound call expected, got %v", tokens)
+	}
+}
+
+// TestChatGroupDefaultByExpiry 跨渠道「谁先到期用谁」default 排序（单元级，只断言
+// groupDefaultModel 的选中结果，分发路径由 TestChatGroupTraeEntries /
+// TestChatGroupDefaultFallsToTraeWhenPoolEmpty 覆盖）：
+//   - trae 重置时刻早于 workbuddy 最早到期批次 → default 落 trae 条目；
+//   - workbuddy 批次先到期 → default 回 cn 条目（倍率未知不再天然压过 trae）；
+//   - trae 渠道到期信号未知（重置日关闭）→ 退化为原倍率/书写序（cn 条目优先）。
+func TestChatGroupDefaultByExpiry(t *testing.T) {
+	up := newRecordUpstream(t)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	groups := []modelgroup.Group{
+		{Name: "dev", Models: []string{"cn:glm-5.2", "trae:glm-5.2"}},
+	}
+	tp := traepool.New("")
+	tp.Add(&traeauth.Auth{UID: "t1", AccessToken: "tat", ExpiresAt: 9999999999})
+	gw := trae.New(trae.Config{Pool: tp, Upstream: traeupstream.New(), WorkMode: "disabled", CreditResetDay: 1})
+	reg := modelgroup.NewRegistry(groups)
+	h := NewHandler(Config{Pool: p, Upstream: up.up, ModelGroups: reg, Trae: gw})
+	g, ok := reg.Lookup("dev")
+	if !ok {
+		t.Fatal("group dev missing")
+	}
+
+	traeExp, ok := gw.EarliestCreditExpiry()
+	if !ok {
+		t.Fatal("trae expiry should be known (servable + reset day set)")
+	}
+
+	// trae 先到期：workbuddy 批次晚于 trae 重置 48h → default 落 trae 条目。
+	p.SetCreditsDetailed("u1", 1000, 0, 0, traeExp.Add(48*time.Hour), 1000)
+	if m, _ := h.groupDefaultModel(&g); m != "trae:glm-5.2" {
+		t.Fatalf("trae expiring sooner: default = %q, want trae:glm-5.2", m)
+	}
+
+	// workbuddy 先到期：批次取 now 与 trae 重置的中点（恒早于 trae、恒在未来）。
+	cnExp := time.Now().Add(time.Until(traeExp) / 2)
+	p.SetCreditsDetailed("u1", 1000, 0, 0, cnExp, 1000)
+	if m, _ := h.groupDefaultModel(&g); m != "cn:glm-5.2" {
+		t.Fatalf("workbuddy expiring sooner: default = %q, want cn:glm-5.2", m)
+	}
+
+	// trae 到期信号未知（重置日关闭）：回到倍率序——两模型倍率均未知时保持书写
+	// 顺序，cn 条目在前。
+	h2 := NewHandler(Config{
+		Pool:        p,
+		Upstream:    up.up,
+		ModelGroups: reg,
+		Trae:        trae.New(trae.Config{Pool: tp, Upstream: traeupstream.New(), WorkMode: "disabled", CreditResetDay: 0}),
+	})
+	if m, _ := h2.groupDefaultModel(&g); m != "cn:glm-5.2" {
+		t.Fatalf("trae expiry unknown: default = %q, want cn:glm-5.2 (rate/config order)", m)
 	}
 }
 

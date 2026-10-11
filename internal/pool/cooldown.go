@@ -99,6 +99,34 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, ea
 	}
 }
 
+// EarliestCreditExpiry 返回指定 realm（cn/global）健康账号中最早的积分到期批次
+// 时刻。口径：healthy（非禁用/暂停/冷却）且存在未来到期批次
+// （creditsEarliestRemaining>0、到期时刻在未来）。供模型组 default 的跨渠道
+// 「谁先到期用谁」排序使用；realm 内无有效信号返回 ok=false（调用方按未知处理，
+// 未知排已知之后）。
+func (p *Pool) EarliestCreditExpiry(realm string) (time.Time, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	var best time.Time
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if !e.healthy(now) {
+			continue
+		}
+		if e.creditsEarliestRemaining <= 0 ||
+			e.creditsEarliestExpiry.IsZero() || !e.creditsEarliestExpiry.After(now) {
+			continue
+		}
+		if best.IsZero() || e.creditsEarliestExpiry.Before(best) {
+			best = e.creditsEarliestExpiry
+		}
+	}
+	return best, !best.IsZero()
+}
+
 // ClearExpiringSnapshots 清空所有账号的快过期/最早到期缓存。配置窗口改变时调用，
 // 避免在新快照写入前继续使用旧窗口得到的路由数据；下一次签到或余额刷新会重建。
 func (p *Pool) ClearExpiringSnapshots() {

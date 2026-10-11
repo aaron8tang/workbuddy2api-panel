@@ -28,6 +28,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -48,6 +49,9 @@ type Config struct {
 	// ModelGroups 模型组注册表（「模型与档位 → 模型组」视图读写展示）。
 	// main 装配注入，SaveConfig 闭包在落盘后热替换（nil = 接口返回空清单）。
 	ModelGroups *modelgroup.Registry
+
+	// Trae trae 渠道门面（阶段 2b 合并；nil = 渠道未启用，不注册 /panel/api/trae/* 端点）。
+	Trae *trae.Gateway
 
 	// ConfigPath config.json 路径与加载器（配置页读写用）。
 	// LoadConfig 返回解析后的配置对象（前端展示/校验用，具体类型由 main 注入的闭包决定）；
@@ -193,6 +197,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.traeRoutes() // trae 渠道端点（Trae==nil 时为空操作）
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -358,6 +363,13 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	}
+
+	// trae 渠道（阶段 2b 合并）：有账号才透出，与 /v1/models 的 modelList 同口径。
+	// 条目 id 带 "trae:" 前缀（ModelEntries 自带），前端按 id 前缀筛选/点选，
+	// 模型组 chips 可直接点选 trae 模型进组（组白名单按裸名判等，天然兼容）。
+	if p.cfg.Trae != nil && p.cfg.Trae.HasAccounts() {
+		out = append(out, p.cfg.Trae.ModelEntries()...)
 	}
 
 	if len(out) == 0 {

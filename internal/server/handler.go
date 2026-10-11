@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -81,6 +83,11 @@ type Config struct {
 	// ModelGroups 模型组注册表（可选；nil = 模型组路由全部 404）。
 	// 注册表由 main 装配并经面板保存配置热替换，handler 侧只读。
 	ModelGroups *modelgroup.Registry
+
+	// Trae trae 渠道门面（阶段 2b 合并；可选；nil = 渠道关闭）。
+	// nil 时 "trae:" 前缀模型名不被识别（恒走主链路并因模型不存在而 404/400），
+	// /v1/models 不追加 trae 条目，/healthz 不含 trae 分档——主链路零回归。
+	Trae *trae.Gateway
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -234,9 +241,11 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	}
 	// realm_servable 域可服务维度：不改判活语义（存在性探活保持不变），
 	// 只新增 CN/global 各自可达性供双域部署运维观察（任一域不可用单独告警）。
+	// trae 分档（阶段 2b 合并）：渠道关闭恒 false，不参与主链路判活。
 	realmServable := map[string]bool{
 		"cn":     h.cfg.Pool.ServableForRealm("cn"),
 		"global": h.cfg.Pool.ServableForRealm("global"),
+		"trae":   h.cfg.Trae != nil && h.cfg.Trae.Servable(),
 	}
 	// 恒无鉴权（负载均衡/编排探活只需 2xx/503 语义），身份靠 service 字段 + X-Service 头双保险。
 	w.Header().Set("X-Service", ServiceName)
@@ -517,6 +526,11 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, entry)
 		}
 	}
+	// trae 渠道名单（阶段 2b 合并）：渠道关闭或无账号时不追加（零回归）；
+	// 条目 id 已带 "trae:" 前缀（Gateway.ModelEntries 产出）。
+	if h.cfg.Trae != nil && h.cfg.Trae.HasAccounts() {
+		out = append(out, h.cfg.Trae.ModelEntries()...)
+	}
 	return out
 }
 
@@ -625,10 +639,12 @@ func (h *Handler) groupLookup(name string) (modelgroup.Group, bool) {
 	return h.cfg.ModelGroups.Lookup(name)
 }
 
-// groupModelPriority 返回组内模型的**生效优先级**顺序：按当前生效积分倍率升序
-// （限时免费 = 0，排最前），倍率相同的保持配置书写顺序；倍率未知（目录未刷新 /
-// 该域无此模型）排在有倍率者之后，同样保持书写顺序。配置里的行顺序因此退化为
-// 「同倍率下的次序」。默认模型选取与 /models 列表都以此顺序为准。
+// groupModelPriority 返回组内模型的**生效优先级**顺序。跨渠道主键：「谁先到期
+// 用谁」——各条目按所属渠道的最早积分到期时刻升序（workbuddy 取主池健康账号的
+// 最早到期批次；trae 按月度重置日估算，见 Gateway.EarliestCreditExpiry）。单渠道
+// 组内所有条目共享同一到期时刻，该键恒平局，退化为原有倍率序，行为不变。次键：
+// 当前生效积分倍率升序（限时免费 = 0 排前），倍率相同的保持配置书写顺序；倍率
+// 或到期时刻未知者整体排在已知者之后。默认模型选取与 /models 列表都以此顺序为准。
 // 返回元素为剥掉思考强度后缀的条目原文（"cn:glm-5.3-flash|max" → "cn:glm-5.3-
 // flash"，档位由 groupEffortFor 按 bare 反查）；倍率查找同样基于剥离后的名字。
 func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
@@ -636,9 +652,36 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 		return nil
 	}
 	type cand struct {
-		model string
-		rate  float64
-		known bool
+		model  string
+		rate   float64
+		known  bool
+		expiry time.Time // 所属渠道最早积分到期时刻
+		expOK  bool
+	}
+	// 渠道到期时刻按 realm 缓存：组内同域条目共享一次查询。
+	expCache := map[string]struct {
+		t  time.Time
+		ok bool
+	}{}
+	channelExpiry := func(realm string) (time.Time, bool) {
+		if c, hit := expCache[realm]; hit {
+			return c.t, c.ok
+		}
+		var t time.Time
+		var ok bool
+		switch {
+		case realm == "trae":
+			if h.cfg.Trae != nil {
+				t, ok = h.cfg.Trae.EarliestCreditExpiry()
+			}
+		case h.cfg.Pool != nil:
+			t, ok = h.cfg.Pool.EarliestCreditExpiry(realm)
+		}
+		expCache[realm] = struct {
+			t  time.Time
+			ok bool
+		}{t, ok}
+		return t, ok
 	}
 	cands := make([]cand, 0, len(g.Models))
 	for _, m := range g.Models {
@@ -649,15 +692,24 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 			rate = h.cfg.Upstream.ModelRate(realm, bare)
 		}
 		v, err := strconv.ParseFloat(rate, 64)
-		cands = append(cands, cand{model: entry, rate: v, known: err == nil})
+		expiry, expOK := channelExpiry(realm)
+		cands = append(cands, cand{model: entry, rate: v, known: err == nil, expiry: expiry, expOK: expOK})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		a, b := cands[i], cands[j]
+		// 主键：跨渠道谁先到期用谁。未知（渠道关闭/无到期信号）排已知之后。
+		if a.expOK != b.expOK {
+			return a.expOK
+		}
+		if a.expOK && !a.expiry.Equal(b.expiry) {
+			return a.expiry.Before(b.expiry)
+		}
+		// 次键：已知倍率者靠前，未知者整体靠后；都未知保持书写顺序（稳定排序）。
 		if a.known != b.known {
-			return a.known // 已知倍率者靠前，未知者整体靠后
+			return a.known
 		}
 		if !a.known {
-			return false // 都未知：保持书写顺序（稳定排序）
+			return false
 		}
 		return a.rate < b.rate
 	})
@@ -668,17 +720,48 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 	return out
 }
 
-// groupDefaultModel 按组内模型**生效优先级**（倍率升序，见 groupModelPriority）选
-// 默认模型：取第一个未被模型级冷却（6004 / 11102 负缓存）阻塞的模型；全部阻塞时
-// 回退优先级最高者（让请求走正常错误路径，客户端拿到上游/模型级阻塞的如实报错，
-// 而不是编造 404）。组不限模型时返回空串（维持"无模型"请求的既有行为）。
+// realmServable 报告 workbuddy 池在指定 realm（cn/global）是否还有健康账号。
+// 口径用 CountsDetailedForRealm 的 healthy（非禁用/非暂停/非冷却），刻意**不含
+// 在途占满**：default 模型选取决定整个会话的走向，应基于稳定信号（停号/禁用/
+// 冷却是管理级状态），秒级在途波动交给后续选号逻辑自己报错，否则一波并发就会
+// 让 default 在渠道间来回漂移、破坏粘性会话的模型一致性。
+func (h *Handler) realmServable(realm string) bool {
+	if h.cfg.Pool == nil {
+		return false
+	}
+	_, healthy, _, _, _ := h.cfg.Pool.CountsDetailedForRealm(realm)
+	return healthy > 0
+}
+
+// groupDefaultModel 按组内模型**生效优先级**（跨渠道到期优先 + 倍率升序，见
+// groupModelPriority）选默认模型：取第一个未被模型级冷却（6004 / 11102 负缓存）
+// 阻塞、且所属渠道当前可服务的模型；全部不可选时回退优先级最高者（让请求走正常
+// 错误路径，客户端拿到上游/模型级阻塞的如实报错，而不是编造 404）。组不限模型时
+// 返回空串（维持"无模型"请求的既有行为）。
 // 第二返回值为该模型的思考强度配置（组条目 "|档位" 后缀，见 Group.Models），
 // 供组路由注入 reasoning_effort；未配置返回 ""（绝不注入，默认档由上游自决）。
 func (h *Handler) groupDefaultModel(g *modelgroup.Group) (string, string) {
 	order := h.groupModelPriority(g)
 	for _, m := range order {
 		bare := modelgroup.BareOf(m)
+		realm, _ := resolveModel(m)
+		// trae 条目（阶段 2b 合并）：主池的模型级冷却（6004/11102）对 trae 渠道
+		// 无意义，只看渠道开关与健康度。渠道关闭或无可服务账号（全停/全冷却）
+		// 时跳过该条目——到期序会让 trae 频繁排前，若不查 Servable 会在 trae
+		// 全冷却时把 default 卡死在 503 而不是回落组内 cn 条目。
+		if realm == "trae" {
+			if h.cfg.Trae == nil || !h.cfg.Trae.Servable() {
+				continue
+			}
+			return m, g.EffortOf(bare)
+		}
+		// cn/global 条目：渠道可服务性对称检查——realm 无健康账号（全停/全禁用/
+		// 全冷却）时跳过，让 default 落到组内其它渠道条目（如 trae），实现组内
+		// 多渠道容灾；条目模型仍被模型级冷却阻塞时同样跳过。
 		if h.cfg.Pool.ModelBlocked(bare).Blocked {
+			continue
+		}
+		if !h.realmServable(realm) {
 			continue
 		}
 		return m, g.EffortOf(bare)
@@ -807,6 +890,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
 	}
 	defer st.done()
+
+	// trae 渠道分发（阶段 2b 合并）：realm=="trae" 的请求整体移交 trae 子系统
+	//（自含选号/换号/Work 兜底/签到退避）。trae 网关有自己的 "| trae #" 表格日志行，
+	// 外层统计行抑制（st.logged），避免同一请求双行记账。
+	// 渠道关闭（Trae==nil）时按未知模型 404——主链路零回归：不带前缀的请求
+	// 根本不会进到这里。
+	if realm == "trae" {
+		if h.cfg.Trae == nil {
+			st.status = http.StatusNotFound
+			st.outcome = reqlog.OutcomeHTTPError
+			writeOpenAIError(w, http.StatusNotFound, "unknown_model",
+				"trae channel is disabled (no trae accounts or trae.enabled=false)")
+			return
+		}
+		st.logged = true
+		// body 已完整读出且可能经组裁决改写（setModelField/effort 注入）——回填给
+		// trae 网关复用（其 ChatCompletions 自行读 body），不重复声明 r.Body 语义。
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		h.cfg.Trae.ChatCompletions(w, r, bareModel)
+		return
+	}
 
 	tried := map[string]bool{}
 	var lastErr error

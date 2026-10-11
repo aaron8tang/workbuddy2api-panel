@@ -93,5 +93,24 @@
         "accounts": []
       }
     ]
+  },
+  "trae": {
+    "enabled": true,
+    "auth_dir": "",
+    "state_file": "./data/trae_state.json",
+    "callback_port": "18080",
+    "checkin_hour": 9,
+    "refresh_hours": [3],
+    "refresh_skew": "24h",
+    "max_rotate": 3,
+    "plan_cooldown": "12h",
+    "soft_cooldown": "60s",
+    "err_threshold": 3,
+    "err_cooldown": "10m",
+    "default_model": "glm-5.2",
+    "work_mode": "auto",
+    "work_bridge_url": "",
+    "work_bridge_token": "",
+    "credit_reset_day": 1
   }
 }
