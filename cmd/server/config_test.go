@@ -157,12 +157,6 @@ func TestNewPoolConfigDefaults(t *testing.T) {
 	if c.SoftRateMaxDur.Hours() != 2 {
 		t.Errorf("soft_rate_max=%v want 2h", c.SoftRateMaxDur)
 	}
-	if !c.SessionSticky.Enabled {
-		t.Error("session_sticky.enabled want true")
-	}
-	if c.SessionTTL.Minutes() != 30 || c.SessionGCInterval.Minutes() != 5 {
-		t.Errorf("session durations=%v/%v", c.SessionTTL, c.SessionGCInterval)
-	}
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		t.Errorf("upstash default should be empty: %+v", c.Upstash)
 	}
@@ -182,8 +176,7 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 			"idle_weight_max":8.0,
 			"prefer_expiring":false,
 			"expiring_soon":"72h"
-		},
-		"session_sticky":{"enabled":false,"ttl":"1h","gc_interval":"2m"}
+		}
 	}`), 0o600)
 	c, err := Load(fp)
 	if err != nil {
@@ -203,12 +196,6 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 	}
 	if c.Pool.PreferExpiring || c.ExpiringSoonDur != 72*time.Hour {
 		t.Errorf("expiring override: enabled=%v window=%v", c.Pool.PreferExpiring, c.ExpiringSoonDur)
-	}
-	if c.SessionSticky.Enabled {
-		t.Error("session_sticky.enabled want false from file")
-	}
-	if c.SessionTTL.Hours() != 1 || c.SessionGCInterval.Minutes() != 2 {
-		t.Errorf("session durations=%v/%v", c.SessionTTL, c.SessionGCInterval)
 	}
 }
 
@@ -577,15 +564,6 @@ func TestScheduleInvalidHourRejected(t *testing.T) {
 		if !strings.Contains(err.Error(), tc.wantSwitch) {
 			t.Errorf("error for %s should point at schedule.%s: %v", tc.body, tc.wantSwitch, err)
 		}
-	}
-}
-
-func TestBadSessionTTL(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"session_sticky":{"ttl":"oops"}}`), 0o600)
-	if _, err := Load(fp); err == nil {
-		t.Fatal("want error for bad session_sticky.ttl")
 	}
 }
 

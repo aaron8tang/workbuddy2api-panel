@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -221,19 +222,28 @@ func nextMonthlyReset(now time.Time, day int) time.Time {
 
 // ModelEntries 返回 trae 渠道的模型条目（OpenAI /v1/models 格式，id 已带 "trae:" 前缀，
 // owned_by 固定 "trae"）。动态拉取失败回退内置静态表。
+// Rate>0 的模型透出 credits 字段（如 "x0.06"）——面板「积分倍率」列与
+// /v1/models 消费者都读该字段；倍率未知（Rate=0）时省略，不编造。
 func (g *Gateway) ModelEntries() []map[string]any {
 	infos := g.fetchDynamicModels()
 	var out []map[string]any
 	if len(infos) > 0 {
 		out = make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {
-			out = append(out, map[string]any{
+			e := map[string]any{
 				"id":             "trae:" + mi.ID,
 				"object":         "model",
 				"created":        1753600000,
 				"owned_by":       "trae",
 				"context_length": contextOr(mi.ContextWindow),
-			})
+			}
+			if mi.Name != "" {
+				e["name"] = mi.Name
+			}
+			if mi.Rate > 0 {
+				e["credits"] = fmtCreditsRate(mi.Rate)
+			}
+			out = append(out, e)
 		}
 		return out
 	}
@@ -256,6 +266,13 @@ func contextOr(v any) any {
 		return 131072
 	}
 	return v
+}
+
+// fmtCreditsRate 把 SOLO 计费倍率格式化为上游 credits 同款展示形态
+//（"x0.06" / "x1.83"），供 /v1/models 与面板「积分倍率」列直接消费。
+// 与 server.fmtCreditsPrefix 的展示口径对齐：x 前缀 + 最短小数表示。
+func fmtCreditsRate(rate float64) string {
+	return "x" + strconv.FormatFloat(rate, 'f', -1, 64)
 }
 
 // KnownBare 判断裸模型名（去 trae: 前缀后）是否在动态/静态模型表或 Work 兜底里。
@@ -292,6 +309,18 @@ func (g *Gateway) modelListRaw() []map[string]any {
 		return out
 	}
 	return staticModels
+}
+
+// RateOf 返回模型的 SOLO 计费倍率（get_detail_param 的
+// display_contact_config.consumption_rate.rate，走动态模型缓存）。未知模型 /
+// 动态表未拉到时返回 0，调用方按「未知倍率」处理（不预扣积分、组裁决排后）。
+func (g *Gateway) RateOf(model string) float64 {
+	for _, mi := range g.fetchDynamicModels() {
+		if mi.ID == model {
+			return mi.Rate
+		}
+	}
+	return 0
 }
 
 // 静态 SOLO 模型表（SPEC P3：32 个 config_name，来自逆向报告；动态拉取失败时回退）。
@@ -466,15 +495,27 @@ type AccountSummary struct {
 	ExpiredSoon bool   `json:"expired_soon,omitempty"`
 	// 最早积分到期（Unix 秒）：权益包 expire_time 明细（0 = 未刷新过明细）
 	CreditExpiresAt int64  `json:"credit_expires_at,omitempty"`
-	MachineID       string `json:"machine_id,omitempty"` // 前 8 位（脱敏）
-	DeviceID        string `json:"device_id,omitempty"`  // 前 8 位（脱敏）
-	HasAuth         bool   `json:"has_auth"`
+	// 24h/48h 内到期作废的积分合计（credit_packs 为空 = 从未刷新过明细，前端显示 —）
+	Exp24h float64 `json:"exp_24h,omitempty"`
+	Exp48h float64 `json:"exp_48h,omitempty"`
+	// 权益包明细快照（面板「24h/48h 到期」列的原始数据源）
+	CreditPacks []pool.CreditPack `json:"credit_packs,omitempty"`
+	MachineID   string            `json:"machine_id,omitempty"` // 前 8 位（脱敏）
+	DeviceID    string            `json:"device_id,omitempty"`  // 前 8 位（脱敏）
+	HasAuth     bool               `json:"has_auth"`
 }
 
+// PoolAccountOrder 返回当前手工使用顺序（面板 traeStatus 透出给前端）。
+func (g *Gateway) PoolAccountOrder() []string { return g.cfg.Pool.AccountOrder() }
+
 // Accounts 返回脱敏账号列表（面板 status 端点与 AccountsHandler 共用）。
+// 24h/48h 到期窗口按天粒度聚合 credit_packs（与主池 expWindowSumsByUID 同口径：
+// 24h→窗口 1 天、48h→窗口 2 天）；无明细时不输出 exp_* 字段（区分 0 与无数据）。
 func (g *Gateway) Accounts() []AccountSummary {
 	statuses := g.cfg.Pool.List()
 	out := make([]AccountSummary, 0, len(statuses))
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	for _, s := range statuses {
 		sum := AccountSummary{
 			UID:      s.UID,
@@ -487,6 +528,28 @@ func (g *Gateway) Accounts() []AccountSummary {
 			ErrCount: s.ErrCount,
 
 			CreditExpiresAt: s.EarliestCreditExpiry,
+		}
+		if len(s.CreditPacks) > 0 {
+			// 有明细快照 → 原样透出（前端区分「0 = 明细存在但窗口内无到期」与
+			//「无 credit_packs = 从未刷新过明细（显示 —）」两种状态）。
+			sum.CreditPacks = s.CreditPacks
+			for _, pk := range s.CreditPacks {
+				if pk.ExpireAt <= 0 || pk.Remain <= 0 {
+					continue
+				}
+				exp := time.Unix(pk.ExpireAt, 0)
+				expDay := time.Date(exp.Year(), exp.Month(), exp.Day(), 0, 0, 0, 0, now.Location())
+				d := int(expDay.Sub(today).Hours() / 24)
+				if d < 0 || d > 2 {
+					continue
+				}
+				if d <= 1 {
+					sum.Exp24h += pk.Remain
+				}
+				if d <= 2 {
+					sum.Exp48h += pk.Remain
+				}
+			}
 		}
 		if a := g.cfg.Pool.AuthByUID(s.UID); a != nil {
 			sum.HasAuth = true
@@ -720,6 +783,23 @@ func (g *Gateway) PatchHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, st)
 }
 
+// OrderHandler POST /panel/api/trae/accounts/order：设置手工使用顺序。
+// body {"order": ["uid1", ...]}——数组序即优先序（与面板 ↑↓ 移动后的展示序一致）；
+// 空数组 = 清空恢复自动模式。响应 {"account_order": [...], "order_active": bool}。
+func (g *Gateway) OrderHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Order []string `json:"order"`
+	}
+	if err := decodeBody(w, r, &req); err != nil {
+		return
+	}
+	g.cfg.Pool.SetAccountOrder(req.Order)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"account_order": g.cfg.Pool.AccountOrder(),
+		"order_active":  g.cfg.Pool.AccountOrderActive(),
+	})
+}
+
 // RefreshHandler POST /panel/api/trae/accounts/{uid}/refresh：手动 ExchangeToken + 落盘。
 func (g *Gateway) RefreshHandler(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
@@ -801,15 +881,17 @@ func (g *Gateway) CreditsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// noteCreditExpiry 把权益包明细里的最早未来到期时刻写进池（0 = 全部无期限 → 清除）。
+// noteCreditExpiry 把权益包明细里的最早未来到期时刻与明细快照写进池（0 = 全部无期限 → 清除）。
 func (g *Gateway) noteCreditExpiry(uid string, packs []upstream.EntPack) {
 	earliest := int64(0)
+	snapshot := make([]pool.CreditPack, 0, len(packs))
 	for _, p := range packs {
 		if p.ExpireAt > 0 && (earliest == 0 || p.ExpireAt < earliest) {
 			earliest = p.ExpireAt
 		}
+		snapshot = append(snapshot, pool.CreditPack{ExpireAt: p.ExpireAt, Remain: float64(p.Limit) - p.Used})
 	}
-	g.cfg.Pool.SetCreditExpiry(uid, earliest)
+	g.cfg.Pool.SetCreditExpiry(uid, earliest, snapshot)
 }
 
 // CheckinHandler POST /panel/api/trae/checkin：立即全量签到（调度器同路径）。

@@ -71,7 +71,14 @@ type Status struct {
 	CreditsExpiring          int64     `json:"credits_expiring,omitempty"`
 	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitempty"`
 	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
-	Cooling                  bool      `json:"cooling"`
+	// Exp24h / Exp48h 本地包快照（pkgs）派生的 24h/48h 窗口内到期积分（天粒度，
+	// 与前端 expBatches 同口径）。由 NoteModelCost 实时扣减 + 每日拉取刷新，
+	// 前端主池表格 24h/48h 列的数据源——不再依赖每次现打上游的明细缓存。
+	// 无快照时省略（前端回退旧数据源）。
+	Exp24h            int64  `json:"exp_24h,omitempty"`
+	Exp48h            int64  `json:"exp_48h,omitempty"`
+	EarliestExpiryDay string `json:"earliest_expiry_day,omitempty"` // 最早未到期批次本地日期 "2006-01-02"
+	Cooling           bool   `json:"cooling"`
 	CoolKind                 string    `json:"cool_kind,omitempty"`
 	CoolRemaining            int64     `json:"cool_remaining_sec,omitempty"`
 	Until                    time.Time `json:"until,omitempty"`
@@ -253,6 +260,12 @@ type entry struct {
 	// 持久化（stateAccount.ModelCosts，P1-anti-monopoly）：重启后成本知识保留；
 	// 落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活。
 	modelCost map[string]modelCostEntry
+	// pkgs 积分包本地快照（FEFO 序：ExpireAt 升序）。每日拉取任务写入（每日一次
+	// 打上游明细），NoteModelCost 按失效时刻升序实时扣减，落盘防 docker 重启失忆。
+	// 独立于聚合值生命周期：credits/creditsExpiring 等仍由余额刷新 authoritative
+	// 维护；ReenableIfCredits（余额刷新成功回调）不清本字段，否则每 5 分钟一次的
+	// 余额刷新会把每日快照打成空白。见 packages.go。
+	pkgs []pkgSnapshot
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 }
@@ -473,6 +486,11 @@ type stateAccount struct {
 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
 	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
 	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
+	// Packages 积分包本地快照（每日拉取 + 消耗实时扣减，见 packages.go）。持久化
+	// 防 docker 重启失忆：包明细每天只拉一次，重启后快照继续生效，NoteModelCost
+	// 的实时扣减与前端 24h/48h 展示不中断。落盘/恢复均惰性过滤已过期包
+	// （重启跨过失效时刻的包不复活）；空切片不写（omitempty）。
+	Packages []pkgSnapshot `json:"packages,omitempty"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态

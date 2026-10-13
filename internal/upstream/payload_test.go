@@ -465,3 +465,25 @@ func TestClampGPTMinMaxTokens(t *testing.T) {
 		})
 	}
 }
+
+// TestStripForbiddenTopFields 客户端私有字段（destination-addr）出站前剥离：
+// TraeCN 在 body 顶层携带本机代理地址，透传到 WorkBuddy 上游会被整体拒收
+// （HTTP 400 "header destination-addr invalid ... loopback NOT allowed"，4028）。
+func TestStripForbiddenTopFields(t *testing.T) {
+	obj, err := decodeBody(PrepareBodyOptWithEffertsPreserve(t,
+		`{"model":"glm-5.2","destination-addr":"127.0.0.1:7863","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, f := range forbiddenTopFields {
+		if _, ok := obj[f]; ok {
+			t.Errorf("field %q should be stripped, got %v", f, obj[f])
+		}
+	}
+	if obj["model"] != "glm-5.2" {
+		t.Errorf("model 应原样保留: %v", obj["model"])
+	}
+	if msgs, ok := obj["messages"].([]any); !ok || len(msgs) != 1 {
+		t.Errorf("messages 应原样保留: %v", obj["messages"])
+	}
+}

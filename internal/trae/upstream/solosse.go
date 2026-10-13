@@ -26,12 +26,21 @@ package upstream
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 )
+
+// ErrEmptyStream 上游 HTTP 200 但整条流没有产出任何 SSE 事件（无 output/usage/
+// done/error，甚至没有 metadata）——多半是上游用 200 + JSON 业务错误体应答，
+// 或静默断流。此前的行为是给客户端只写一个 data: [DONE]（零内容零 finish_reason），
+// agent 客户端把这种空完成显示成「用户已取消」，且服务端记为 200 成功，完全无感知。
+// 现在转为：给客户端写一条 error 事件 + [DONE]，并返回本哨兵错误供调用方记账号
+// 错误计数与日志诊断（配合 HeadCapture 采样上游原始响应体）。
+var ErrEmptyStream = errors.New("upstream stream contained no SSE events")
 
 // SOLOEvent 单条 SOLO SSE 事件（归一化）。
 type SOLOEvent struct {
@@ -56,12 +65,12 @@ func (e *SOLOStreamError) Error() string {
 	return fmt.Sprintf("solo error code=%d msg=%s", e.Code, e.Msg)
 }
 
-// Kind 将 SSE 流内错误分类。1005 / 4008 → ErrPlanLimit；4011 → ErrSoftRate；其余归 ErrClient。
+// Kind 将 SSE 流内错误分类。1005 / 4008 → ErrPlanLimit；4011 / 3004 → ErrSoftRate；其余归 ErrClient。
 func (e *SOLOStreamError) Kind() ErrKind {
 	if e.Code == 1005 || e.Code == 4008 {
 		return ErrPlanLimit
 	}
-	if e.Code == 4011 {
+	if e.Code == 4011 || e.Code == 3004 {
 		return ErrSoftRate
 	}
 	return ErrClient
@@ -154,6 +163,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		toolCalls    = map[int]map[string]any{}
 		toolOrder    []int
 		upstreamErr  error
+		sawAny       bool // 解析到过任意 SSE 事件（空流检测，见 ErrEmptyStream）
 	)
 	st := &sseState{}
 	for {
@@ -162,6 +172,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			return nil, err
 		}
 		if ev := scanLine(st, strings.TrimRight(line, "\r\n")); ev != nil {
+			sawAny = true
 			switch ev.Event {
 			case "metadata":
 				if id == "" && ev.Usage != nil {
@@ -187,6 +198,11 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	}
 	if upstreamErr != nil {
 		return nil, upstreamErr
+	}
+	if !sawAny {
+		// 200 但整条流无任何 SSE 事件：按上游错误处理（调用方计账号错误并
+		// 对客户端如实报 502），不再把空 completion 当成功透出。
+		return nil, ErrEmptyStream
 	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -311,8 +327,12 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 	return streamOpts(w, r, nil)
 }
 
-// StreamWithError 同 Stream，额外在遇到上游 event:error 时回调 onErr（非 nil），
-// 供调用方冷却账号/记录日志；错误信息同时注入 SSE 事件流。
+// StreamWithError 同 Stream，额外在遇到上游 event:error 时回调 onErr（非 nil）。
+//
+// 早错不透传语义：若 error 事件发生在尚未向客户端写过任何内容 chunk 之前
+//（wroteAny=false），本函数不写 SSE、不消耗 w，只把 *SOLOStreamError 返回给
+// 调用方——调用方可据此冷却账号并轮转下一账号重试（此时响应头未提交，可安全
+// 换号）。只有已写出内容后的中途错误才写 error 事件 + [DONE] 透传给客户端。
 func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) error {
 	return streamOpts(w, r, onErr)
 }
@@ -330,8 +350,10 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	var pendingUsage map[string]any
 	sawDone := false
+	wroteAny := false // 已向客户端写过内容 chunk（空流检测）
 	st := &sseState{}
 	writeChunk := func(delta map[string]any, finish string) error {
+		wroteAny = true
 		chunk := map[string]any{
 			"id":      id,
 			"object":  "chat.completion.chunk",
@@ -420,31 +442,76 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 				}
 				sawDone = true
 			case "error":
-				// 上游业务错误：回调 + 写一条 error 事件 + [DONE]。
-				se := &SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
-				if onErr != nil {
-					onErr(se)
-				}
-				msg := fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage)
-				if _, err := io.WriteString(w, "event: error\n"+"data: "+jsonEscape(msg)+"\n\n"); err != nil {
-					return err
-				}
-				if err := writeDONE(); err != nil {
-					return err
-				}
-				sawDone = true
+			// 上游业务错误：回调 + 视已写状态决定透传或返回。
+			se := &SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
+			if onErr != nil {
+				onErr(se)
 			}
+			if !wroteAny {
+				// 早错（未写过任何内容 chunk）：不向客户端写任何字节，
+				// 响应头未提交 → 调用方可安全冷却账号并轮转重试。
+				return se
+			}
+			msg := fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage)
+			if _, err := io.WriteString(w, "event: error\n"+"data: "+jsonEscape(msg)+"\n\n"); err != nil {
+				return err
+			}
+			if err := writeDONE(); err != nil {
+				return err
+			}
+			sawDone = true
+		}
 		}
 		if err == io.EOF {
 			break
 		}
 	}
 	if !sawDone {
-		// 幂等兜底：上游中断（无 done）仍写 [DONE]。
+		if !wroteAny {
+			// 空流：上游 200 但没有产出任何事件（疑似 200+JSON 业务错误体或静默
+			// 断流）。给客户端一条 error 事件让 agent 端如实报错（而非显示成
+			// 「用户已取消」），并返回哨兵错误供调用方记账号错误计数与诊断日志。
+			if _, err := io.WriteString(w, "event: error\n"+"data: "+jsonEscape(ErrEmptyStream.Error())+"\n\n"); err != nil {
+				return err
+			}
+			if err := writeDONE(); err != nil {
+				return err
+			}
+			return ErrEmptyStream
+		}
+		// 有内容但上游中断（无 done）：幂等兜底仍写 [DONE]。
 		return writeDONE()
 	}
 	return nil
 }
+
+// HeadCapture 透传 reader：保留流的前 max 字节原始样本，供空流等异常场景的
+// 诊断日志（看上游到底回了什么——200+JSON 业务错误体在这里现形）。
+type HeadCapture struct {
+	r   io.Reader
+	buf []byte
+	max int
+}
+
+// NewHeadCapture 包装 r，采样前 max 字节。
+func NewHeadCapture(r io.Reader, max int) *HeadCapture {
+	return &HeadCapture{r: r, max: max}
+}
+
+func (h *HeadCapture) Read(p []byte) (int, error) {
+	n, err := h.r.Read(p)
+	if n > 0 && len(h.buf) < h.max {
+		room := h.max - len(h.buf)
+		if n < room {
+			room = n
+		}
+		h.buf = append(h.buf, p[:room]...)
+	}
+	return n, err
+}
+
+// Head 返回已采样的原始字节（UTF-8 容错展示由调用方负责截断）。
+func (h *HeadCapture) Head() string { return string(h.buf) }
 
 func jsonEscape(s string) string {
 	raw, _ := json.Marshal(s)

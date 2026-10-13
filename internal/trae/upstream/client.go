@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/promptcache"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
 )
 
@@ -105,6 +106,12 @@ type Client struct {
 	UgHost    string // https://api.trae.cn
 	OAuthHost string // https://api.trae.com.cn
 	ClientID  string // en1oxy7wnw8j9n
+
+	// UserAgent SOLO 对话/模型请求出站 User-Agent 覆盖（config trae.user_agent）。
+	// 空 = 内置默认 "hertz"（WorkBuddy 客户端调 trae 后端的特征 UA）。
+	// 仅影响 SOLOHeaders 路径（llm_utils_chat / get_detail_param）；
+	// ug/oauth 域（签到/积分/token 刷新）仍用内置 Trae/<IdeVersion>。
+	UserAgent string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -234,12 +241,36 @@ func normalizeExpiresAt(v int64) int64 {
 // ChatStream 发 llm_utils_chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify）、err 为 nil；
 // 只有传输层失败才返回 err。
-func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBody(body)))
+// conversationID 为编排层（chat.go）用 promptcache 统一解析链在原始 body/
+// 请求头上解析出的会话标识，用作 prompt_cache_key 的会话哈希源（P0 费用
+// 优化）。key 去账号化（promptcache 共享实现）：同会话跨账号轮询/跨池往返
+// 时 key 恒定，池内前缀缓存不失配。
+func (c *Client) ChatStream(a *auth.Auth, body []byte, conversationID string) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	prepared := PrepareBody(body)
+	// 注入 prompt_cache_key（必须在 PrepareBody 之后：白名单此前会剔掉该
+	// 字段；白名单现已放行）。注入在瘦身前：CompactBody 的 reassemble 保留
+	// 其余顶层字段，key 在瘦身后存活；key 仅 ~80B 不影响瘦身预算。
+	prepared = promptcache.InjectPromptCacheKey(prepared, conversationID)
+	// 超长历史瘦身：3MB 级 agent 会话触发上游 3004（按体量限流，换号无效）。
+	// 优先两段式 compaction（P1）：稳定裁剪点 + 摘要前置 → 出站前缀跨轮
+	// 字节一致，上方注入的 prompt_cache_key 才能真正命中；无 conversationID /
+	// 无法处理时回落旧 CompactBody 滑动裁剪。channel="solo"：summaryCache
+	// 按通道分桶（两池 PrepareBody 改写语义不同，跨池指纹必失配）。
+	compacted, dropped := promptcache.CompactBodyWithSummary(prepared, promptcache.CompactLimits{}, "solo", conversationID)
+	if compacted == nil {
+		compacted, dropped = promptcache.CompactBody(prepared, promptcache.CompactLimits{})
+		if dropped > 0 {
+			promptcache.LogCompactResult("solo", len(prepared), len(compacted), dropped)
+		}
+	}
+	if compacted != nil {
+		prepared = compacted
+	}
+	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(prepared))
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	SOLOHeaders(req, a, true)
+	c.SOLOHeaders(req, a, true)
 	// 用专用流客户端（无总超时），避免长 SSE 流被 HTTP.Timeout 截断。
 	hc := c.HTTP
 	if c.StreamHTTP != nil {
@@ -265,8 +296,9 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 type ModelInfo struct {
 	ID            string
 	Name          string
-	ContextWindow int64 // = maxInputTokens
-	MaxTokens     int64 // = maxOutputTokens
+	ContextWindow int64   // = maxInputTokens
+	MaxTokens     int64   // = maxOutputTokens
+	Rate          float64 // consumption_rate.data.rate 计费倍率；0 = 未知/未启用
 }
 
 // FetchModels 拉 SOLO 模型表（get_detail_param，32 配置）。
@@ -285,7 +317,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	SOLOHeaders(req, a, false)
+	c.SOLOHeaders(req, a, false)
 	data, err := c.doJSON(req)
 	if err != nil {
 		return nil, err
@@ -296,7 +328,11 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			DisplayConfig struct {
 				DisplayName string `json:"display_name"`
 			} `json:"display_config"`
-			ModelDetailList []struct {
+			// display_contact_config 内嵌 JSON 字符串（与 display_config 是两个字段）：
+			// {"consumption_rate":{"enable":true,"data":{"rate":0.06}}} —— TraeCN
+			// 客户端「模型倍率」展示列的数据源（实测 glm-5.3-flash=0.06、glm-5.3=0.78）。
+			DisplayContactConfig string `json:"display_contact_config"`
+			ModelDetailList      []struct {
 				ModelName string `json:"model_name"`
 			} `json:"model_detail_list"`
 		} `json:"config_info_list"`
@@ -312,12 +348,37 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		out = append(out, ModelInfo{
 			ID:   cfg.ConfigName,
 			Name: cfg.DisplayConfig.DisplayName,
+			Rate: parseConsumptionRate(cfg.DisplayContactConfig),
 		})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	return out, nil
+}
+
+// parseConsumptionRate 从 display_contact_config 内嵌 JSON 提取
+// consumption_rate.data.rate（模型计费倍率）。字段缺失/不可解析/enable=false
+// 一律返回 0（调用方按「未知倍率」处理：不预扣积分、组裁决排未知档）。
+func parseConsumptionRate(displayContactConfig string) float64 {
+	if displayContactConfig == "" {
+		return 0
+	}
+	var cc struct {
+		ConsumptionRate struct {
+			Enable bool `json:"enable"`
+			Data   struct {
+				Rate float64 `json:"rate"`
+			} `json:"data"`
+		} `json:"consumption_rate"`
+	}
+	if err := json.Unmarshal([]byte(displayContactConfig), &cc); err != nil {
+		return 0
+	}
+	if !cc.ConsumptionRate.Enable {
+		return 0
+	}
+	return cc.ConsumptionRate.Data.Rate
 }
 
 // ErrCheckinRateLimited 上游签到设备级限流（业务码 9074）。

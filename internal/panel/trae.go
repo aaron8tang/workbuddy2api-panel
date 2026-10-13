@@ -18,6 +18,7 @@ func (p *Panel) traeRoutes() {
 	p.mux.HandleFunc("GET /panel/api/trae/status", p.withAuth(p.traeStatus))
 	p.mux.HandleFunc("GET /panel/api/trae/accounts", p.withAuth(g.AccountsHandler))
 	p.mux.HandleFunc("POST /panel/api/trae/accounts/import", p.withAuth(g.ImportHandler))
+	p.mux.HandleFunc("POST /panel/api/trae/accounts/order", p.withAuth(g.OrderHandler))
 	p.mux.HandleFunc("DELETE /panel/api/trae/accounts/{uid}", p.withAuth(g.DeleteHandler))
 	p.mux.HandleFunc("PATCH /panel/api/trae/accounts/{uid}", p.withAuth(g.PatchHandler))
 	p.mux.HandleFunc("POST /panel/api/trae/accounts/{uid}/refresh", p.withAuth(g.RefreshHandler))
@@ -30,7 +31,8 @@ func (p *Panel) traeRoutes() {
 }
 
 // traeStatus 渠道总览（前端区块头渲染用）：enabled（网关已装配）+ servable
-//（存在可服务账号）+ accounts（复用 Gateway 脱敏列表，免二次请求）。
+//（存在可服务账号）+ accounts（复用 Gateway 脱敏列表，免二次请求）+
+// account_order（手工顺序，↑↓ 移动后前端重排展示用）。
 func (p *Panel) traeStatus(w http.ResponseWriter, r *http.Request) {
 	g := p.cfg.Trae
 	if g == nil {
@@ -38,8 +40,9 @@ func (p *Panel) traeStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled":  true,
-		"servable": g.Servable(),
-		"accounts": g.Accounts(),
+		"enabled":       true,
+		"servable":      g.Servable(),
+		"accounts":      g.Accounts(),
+		"account_order": g.PoolAccountOrder(),
 	})
 }

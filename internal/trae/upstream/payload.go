@@ -18,6 +18,8 @@ import (
 //  3. model → config_name + model
 //  4. function: 固定 "solo_work_lite"
 //  5. tools/tool_choice: 归一化（"none" 删 tools；auto/required 保留；function 提取 name）
+//  6. 白名单之外的顶层字段全部剔除：agent CLI / 第三方调用方塞的私有字段
+//     （如 destination-addr 类代理地址）被透传给上游会触发 400/4028 拒绝。
 func PrepareBody(src []byte) []byte {
 	if len(src) == 0 {
 		return src
@@ -25,6 +27,11 @@ func PrepareBody(src []byte) []byte {
 	var obj map[string]any
 	if err := json.Unmarshal(src, &obj); err != nil {
 		return src
+	}
+	for k := range obj {
+		if !soloAllowedFields[k] {
+			delete(obj, k)
+		}
 	}
 	obj["stream"] = true
 	obj["function"] = Function
@@ -102,6 +109,36 @@ func PrepareBody(src []byte) []byte {
 
 // DefaultConfigName 默认模型（glm-5.2，实测可用）。
 const DefaultConfigName = "glm-5.2"
+
+// soloAllowedFields 出站 body 顶层字段白名单：SOLO 已知字段 + OpenAI 常规
+// 采样参数。服务端注入的 reasoning_effort 也在此列（组档位裁决产物）。
+var soloAllowedFields = map[string]bool{
+	// SOLO 协议字段
+	"messages":    true,
+	"stream":      true,
+	"function":    true,
+	"config_name": true,
+	"model":       true,
+	"tools":       true,
+	"tool_choice": true,
+	// OpenAI 常规采样/行为参数（上游可容忍的多余字段，保守保留）
+	"temperature":    true,
+	"top_p":          true,
+	"max_tokens":     true,
+	"top_k":          true,
+	"frequency_penalty": true,
+	"presence_penalty":  true,
+	"stop":           true,
+	"seed":           true,
+	"reasoning_effort":   true,
+	"reasoning":          true,
+	"thinking":           true,
+	// prompt_cache_key：上游前缀缓存键（P0 费用优化，cache_key.go 注入；
+	// 白名单放行让客户端自带的 key 存活，注入函数对其不覆盖）。
+	"prompt_cache_key": true,
+	// 剔除示例：user / metadata / stream_options / destination_addr /
+	// response_format / logprobs …——SOLO Go struct 之外的字段一律不透传。
+}
 
 // normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。
 //   - "none" / {"type":"none"} → 删 tool_choice + 删 tools/functions

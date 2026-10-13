@@ -830,10 +830,219 @@ process.stdout.write(JSON.stringify(names));`
 	if err != nil {
 		t.Fatalf("expiry sort node test failed: %v\n%s", err, out)
 	}
-	// 最快到期的排最前（跨域）；无 7 天内到期的与查询失败的排最后。
+	// 最快到期的排最前（跨域）；无未到期批次的与查询失败的排最后。
 	const want = `["gl-soon","cn-mid","cn-late","no-expiry","broken"]`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry order=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSExpiryWindowFollowsConfig 到期提醒的统计窗口跟随后端下发的快过期路由
+// 窗口（packages 响应的 expiring_window_hours），不再写死 7 天——面板统计口径必须
+// 与 pool.expiring_soon 同源。缺字段回落 168h 旧行为（兼容旧后端/测试桩）。
+func TestAppJSExpiryWindowFollowsConfig(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry window test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expBatches');
+const end = src.indexOf('async function loadExpiry');
+if (start < 0 || end < 0 || end < start) throw new Error('expiry region not found');
+const sink = { innerHTML: '', textContent: '', hidden: true };
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  $: () => sink,
+  Date, Math, Number, String, Map, Array, Object, isNaN,
+  lastPackages: null, lastPackagesAt: 0,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderExpiry = renderExpiry;', ctx);
+const iso = n => {
+  const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
+  const p = x => String(x).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+};
+const pack = (days, amount) => ({ end_time: iso(days) + ' 00:00:00', remain: amount });
+// 两批：明天 100（窗口内）+ 5 天后 500（窗口外）。24h 窗口下 week==first → 不显示合计；
+// 缺字段回落 168h 下 week=600 > 100 → 显示「7 天内合计 600」。
+const acct = { uid: 'a', nickname: 'two-batches', realm: 'cn', packages: [pack(1, 100), pack(5, 500)] };
+ctx.renderExpiry({ expiring_window_hours: 24, accounts: [acct] });
+const narrow = sink.innerHTML;
+ctx.renderExpiry({ accounts: [acct] });
+const legacy = sink.innerHTML;
+ctx.renderExpiry({ expiring_window_hours: 24, accounts: [{ uid: 'b', nickname: 'no-exp', realm: 'cn', packages: [pack(-3, 100)] }] });
+const none = sink.innerHTML;
+process.stdout.write(JSON.stringify({
+  narrowHasTotal: narrow.includes('合计'),
+  legacyHasTotal: legacy.includes('7 天内合计 600'),
+  noneLabel: none.includes('1 天内无到期积分'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "expwin-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry window node test failed: %v\n%s", err, out)
+	}
+	const want = `{"narrowHasTotal":false,"legacyHasTotal":true,"noneLabel":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("expiry window=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSAccountsSortedFEFOAndManualOrder 账号池展示顺序：默认 FEFO（最早到期
+// 批次升序，需要到期缓存数据），手工使用顺序（poolOrder）非空时压过 FEFO——展示
+// 顺序与选号使用顺序同源。无到期数据且无手工顺序时保持后端原序。
+func TestAppJSAccountsSortedFEFOAndManualOrder(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; accounts sort test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expWindowSumsByUID');
+const end = src.indexOf('function renderModelLocks');
+if (start < 0 || end < 0 || end < start) throw new Error('accounts region not found');
+const sink = { innerHTML: '' };
+const ctx = {
+  $: () => sink,
+  esc: s => String(s == null ? '' : s),
+  ago: () => '—', dur: () => '',
+  rateLimitRowsHtml: () => '',
+  formatTokenCount: () => '—', formatLatency: () => '—', formatRate: () => '—',
+  fmtTok: v => String(v),
+  // 与 app.js 中实现一致的到期批次提取（区域切片不含它们，此处桩同款逻辑）。
+  expBatches: packs => {
+    const byDay = new Map();
+    for (const p of packs || []) {
+      const r = Number(p.remain || 0), t = (p.end_time || '').slice(0, 10);
+      if (r <= 0 || !t) continue;
+      byDay.set(t, (byDay.get(t) || 0) + r);
+    }
+    return [...byDay.entries()].map(([date, remain]) => ({ date, remain }))
+      .sort((a, b) => (a.date < b.date ? -1 : 1));
+  },
+  expDaysLeft: (d, today) => Math.round((new Date(d + 'T00:00:00') - today) / 86400000),
+  Date, Math, Number, String, Map, Array, Object, isNaN,
+  lastPackages: null, poolOrder: null, lastAccRender: null,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderAccounts = renderAccounts;', ctx);
+const iso = n => {
+  const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
+  const p = x => String(x).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+};
+const acct = (uid, nick) => ({ uid, nickname: nick, realm: 'cn', credits: 100, credits_total: 100 });
+const pkgs = {
+  accounts: [
+    { uid: 'u-far',  packages: [{ end_time: iso(31) + ' 00:00:00', remain: 500 }] },
+    { uid: 'u-soon', packages: [{ end_time: iso(1) + ' 00:00:00', remain: 100 }] },
+  ],
+};
+const names = () => [...sink.innerHTML.matchAll(/<div class="nm">([^<]*)<\/div>/g)].map(m => m[1]);
+// ① FEFO：后端序 far 在前，按最早到期重排后 soon 在前。
+ctx.lastPackages = pkgs; ctx.poolOrder = null;
+ctx.renderAccounts([acct('u-far', 'far'), acct('u-soon', 'soon')]);
+const fefo = names();
+// ② 手工顺序压过 FEFO：order=[far] → far 回到最前（使用顺序 override）。
+ctx.poolOrder = ['u-far'];
+ctx.renderAccounts([acct('u-far', 'far'), acct('u-soon', 'soon')]);
+const manual = names();
+// ③ 未覆盖垫底：order=[u-x]（不在列表）→ 展示保持后端原序（全部垫底、稳定排序）。
+ctx.poolOrder = ['u-x'];
+ctx.renderAccounts([acct('u-far', 'far'), acct('u-soon', 'soon')]);
+const unranked = names();
+process.stdout.write(JSON.stringify({ fefo, manual, unranked }));`
+	f, err := os.CreateTemp(t.TempDir(), "accorder-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("accounts sort node test failed: %v\n%s", err, out)
+	}
+	const want = `{"fefo":["soon","far"],"manual":["far","soon"],"unranked":["far","soon"]}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("accounts order=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSAutoOrderFetchesExpiryWhenCold 「按到期自动排序」按钮的冷缓存自动查询：
+// FEFO 展示依赖 lastPackages 到期缓存，本次会话没查过到期时表格保持后端原序——
+// 原序第一可能恰好是到期最远的号，观感即「排序反了」（用户实报）。按钮点击后
+// 缓存缺失/过期（> EXP_FRESH_MS）必须主动调 loadExpiry(true) 补数据，缓存新鲜时
+// 不重复打上游。
+func TestAppJSAutoOrderFetchesExpiryWhenCold(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; auto-order test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('// 恢复自动排序');
+const end = src.indexOf('/* ── 模型');
+if (start < 0 || end < 0 || end < start) throw new Error('auto-order region not found');
+const sinks = {};
+const ctx = {
+  $: id => (sinks[id] = sinks[id] || {}),
+  api: async (m, opt) => { ctx.apiCalls.push(m); return {}; },
+  toast: () => {},
+  loadExpiry: async force => {
+    ctx.expCalls.push(force);
+    ctx.lastPackages = { accounts: [] };   // 模拟查询成功后写入缓存
+    ctx.lastPackagesAt = Date.now();
+  },
+  loadOverview: async () => { ctx.overviewCalls++; },
+  Date, Number,
+  EXP_FRESH_MS: 120000,   // 切片区域不含其声明（app.js 顶部常量），桩补同值
+  apiCalls: [], expCalls: [], overviewCalls: 0,
+  lastPackages: null, lastPackagesAt: 0, poolOrder: null,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end), ctx);
+if (!sinks.btnAutoOrder || !sinks.btnAutoOrder.onclick) throw new Error('btnAutoOrder handler not bound');
+(async () => {
+  // ① 冷缓存：点击 → 自动拉到期数据（force=true）→ 再 loadOverview 重排（FEFO 兑现）。
+  await sinks.btnAutoOrder.onclick();
+  const cold = { exp: ctx.expCalls.slice(), api: ctx.apiCalls.slice(), ov: ctx.overviewCalls, filled: !!ctx.lastPackages };
+  // ② 新鲜缓存（EXP_FRESH_MS 内）：点击 → 不再打上游。
+  ctx.expCalls.length = 0; ctx.apiCalls.length = 0; ctx.overviewCalls = 0;
+  ctx.lastPackagesAt = Date.now();
+  await sinks.btnAutoOrder.onclick();
+  const fresh = { exp: ctx.expCalls.slice(), api: ctx.apiCalls.slice(), ov: ctx.overviewCalls };
+  process.stdout.write(JSON.stringify({ cold, fresh }));
+})();`
+	f, err := os.CreateTemp(t.TempDir(), "autoorder-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("auto-order node test failed: %v\n%s", err, out)
+	}
+	const want = `{"cold":{"exp":[true],"api":["config"],"ov":1,"filled":true},"fresh":{"exp":[],"api":["config"],"ov":1}}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("auto-order behavior=%s\nwant %s", strings.TrimSpace(string(out)), want)
 	}
 }
 

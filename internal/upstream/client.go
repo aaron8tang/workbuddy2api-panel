@@ -22,6 +22,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/promptcache"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -784,7 +785,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
-func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
+func (c *Client) prepareBody(body []byte, realm, conversationID string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	if realmKey(realm) == "global" {
 		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
@@ -793,9 +794,10 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
 	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
-	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
-	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
-	body = InjectPromptCacheKey(body, uid, conversationID)
+	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：promptcache 共享
+	// 实现，key 去账号化——同会话跨账号轮询时 key 恒定，池内前缀缓存不失配；
+	// 与 SOLO 通道同一实现（跨池一致性见 promptcache 包注释）。
+	body = promptcache.InjectPromptCacheKey(body, conversationID)
 	return body
 }
 
@@ -1019,9 +1021,32 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	// 缓存会话口径：CacheConversationID 是 handler 在改写前原始 body 上按
+	// promptcache 统一解析链算出的（与 SOLO 通道跨池一致）；零值调用方
+	// （ChatMeta{}）回落出站头透传口径。
+	convForCache := meta.CacheConversationID
+	if convForCache == "" {
+		convForCache = meta.ConversationID
+	}
+	prepared := c.prepareBody(body, a.Realm(), convForCache)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
+	}
+	// 超长历史两段式 compaction（P1，与 SOLO 通道同款共享实现）：稳定裁剪
+	// 点 + 摘要前置 → 出站前缀跨轮字节一致，上方注入的 prompt_cache_key 才能
+	// 命中。插在 prepareBody/ensureConsoleSystem 之后（指纹对最终出站形态）；
+	// channel 按 realm 分桶（两池 PrepareBody 改写语义不同跨池指纹必失配，
+	// global 因 ensureConsoleSystem 出站形态不同与 cn 也须分桶）。
+	channel := realmKey(a.Realm())
+	compacted, dropped := promptcache.CompactBodyWithSummary(prepared, promptcache.CompactLimits{}, channel, convForCache)
+	if compacted == nil {
+		compacted, dropped = promptcache.CompactBody(prepared, promptcache.CompactLimits{})
+		if dropped > 0 {
+			promptcache.LogCompactResult(channel, len(prepared), len(compacted), dropped)
+		}
+	}
+	if compacted != nil {
+		prepared = compacted
 	}
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +

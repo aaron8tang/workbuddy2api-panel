@@ -3,7 +3,6 @@ package pool
 import (
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -47,61 +46,6 @@ func TestAvailableUIDsForRealm(t *testing.T) {
 	want = []string{"cn1", "cn2", "g1", "g2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("AvailableUIDsForRealm()=%v want %v", got, want)
-	}
-}
-
-func TestAvailableUIDsForModelRealm(t *testing.T) {
-	p := realmPool(t)
-	// 6004 模型冷却只落在 cn-1 上 → AvailableUIDsForModelRealm("glm-5.2","cn") 排除它，
-	// 但 cn 集合至少还保底 cn-2；global 集合不受 cn 冷却影响。
-	p.CooldownSoftForModel("cn1", 10*time.Minute, time.Now().Add(30*time.Minute), "glm-5.2", "model 6004")
-
-	got := p.AvailableUIDsForModelRealm("glm-5.2", "cn")
-	if len(got) != 1 || got[0] != "cn2" {
-		t.Errorf("AvailableUIDsForModelRealm(glm-5.2,cn)=%v want [cn2]", got)
-	}
-	got = p.AvailableUIDsForModelRealm("glm-5.2", "global")
-	want := []string{"g1", "g2"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("AvailableUIDsForModelRealm(glm-5.2,global)=%v want %v", got, want)
-	}
-	// realm=="" → 等价 AvailableUIDsForModel（模型豁免照常：cn1 仍被该模型冷却排除）。
-	got = p.AvailableUIDsForModelRealm("glm-5.2", "")
-	want = []string{"cn2", "g1", "g2"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("AvailableUIDsForModelRealm(glm-5.2)=%v want %v", got, want)
-	}
-}
-
-func TestWeightedAvailableUIDsForModelRealm(t *testing.T) {
-	p := realmPool(t)
-	now := time.Now()
-	p.SetCreditsDetailed("cn2", 100, 100, 100, now.Add(time.Hour), 100)
-
-	got := p.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
-	want := []string{"cn1", "cn2", "cn2", "cn2"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("weighted cn candidates=%v want %v", got, want)
-	}
-
-	// 在途满载账号不进入候选，快过期权重不得突破现有并发上限。
-	p.SetMaxInFlight(1)
-	if !p.Acquire("cn2") {
-		t.Fatal("failed to acquire cn2")
-	}
-	got = p.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
-	want = []string{"cn1"}
-	p.Release("cn2")
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("in-flight-full weighted candidates=%v want %v", got, want)
-	}
-
-	// 关闭总开关后逐账号只出现一次，旧行为完全恢复。
-	p.SetPreferExpiring(false)
-	got = p.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
-	want = []string{"cn1", "cn2"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("disabled weighted cn candidates=%v want %v", got, want)
 	}
 }
 

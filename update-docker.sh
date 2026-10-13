@@ -14,6 +14,7 @@ set -euo pipefail
 IMAGE="${1:-workbuddy2api-panel:local}"
 NAME="workbuddy2api"
 PORT="7863"
+CBPORT="18080"   # trae 渠道 Web 登录回调（/authorize），与 docker-compose.yml ports 一致
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # Convert Git Bash /e/... style path to E:/... (docker mounts need drive paths)
@@ -29,7 +30,7 @@ command -v docker >/dev/null 2>&1 || die "docker not available (not installed or
 OLD_IMAGE="$(docker inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null || true)"
 
 run_container() { # $1 = image name
-  docker run -d --name "$NAME" -p "$PORT:$PORT" -e TZ=Asia/Shanghai \
+  docker run -d --name "$NAME" -p "$PORT:$PORT" -p "$CBPORT:$CBPORT" -e TZ=Asia/Shanghai \
     -v "$ROOT/auths:/app/auths" \
     -v "$ROOT/data:/app/data" \
     -v "$ROOT/config.json:/app/config.json" \

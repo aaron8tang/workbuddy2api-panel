@@ -15,6 +15,7 @@ set "IMAGE=%~1"
 if "%IMAGE%"=="" set "IMAGE=workbuddy2api-panel:local"
 set "NAME=workbuddy2api"
 set "PORT=7863"
+set "CBPORT=18080"
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
@@ -87,7 +88,12 @@ rem ---------- subroutines ----------
 
 :start
 rem %1 = image name
-docker run -d --name %NAME% -p %PORT%:%PORT% -e TZ=Asia/Shanghai ^
+rem 18080 = trae channel web-login callback (/authorize): TRAE login page redirects
+rem to host 127.0.0.1:18080, port-mapped into the container (binds :18080 on all
+rem interfaces inside). Keep in sync with docker-compose.yml ports (this script
+rem uses plain docker run, not compose). NOTE: keep comments ASCII-only - cmd
+rem parses this file in the OEM codepage and UTF-8 Chinese here breaks parsing.
+docker run -d --name %NAME% -p %PORT%:%PORT% -p %CBPORT%:%CBPORT% -e TZ=Asia/Shanghai ^
   -v "%ROOT%\auths:/app/auths" ^
   -v "%ROOT%\data:/app/data" ^
   -v "%ROOT%\config.json:/app/config.json" ^

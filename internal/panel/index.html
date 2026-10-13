@@ -665,12 +665,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
         <div class="stat warn"><div class="v" id="sPaused">-</div><div class="k">已暂停选号</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
-        <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
 
       <div class="box" id="expBox" hidden>
         <header>
-          <h3>积分到期提醒<span class="hint">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
+          <h3>积分到期提醒<span class="hint">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）· 统计窗口 = 快过期路由窗口（expiring_soon）</span></h3>
           <span class="grow"></span>
           <span class="note" id="expNote"></span>
           <button class="xs" id="btnExp">检查</button>
@@ -680,9 +679,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box">
         <header>
-          <h3>账号池</h3>
+          <h3>账号池<span class="hint">默认按最早到期排序（FEFO；未查过到期时保持加载序，点「按到期自动排序」会自动查询后生效；上游按失效先后优先扣减）· ↑↓ 调整使用顺序：手工顺序保存后选号按面板顺序优先（排前者先用）</span></h3>
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
+          <button class="xs" id="btnAutoOrder" hidden>按到期自动排序</button>
           <button class="xs" id="btnCheckinAll">全部签到</button>
           <button class="xs" id="btnTravelAll">旅行巡检</button>
           <button class="xs" id="btnActivityAll">活跃上报</button>
@@ -693,7 +693,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
             <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
+            <th>成功 / 失败</th><th>在途</th><th>用量</th><th class="num" title="24 小时内到期作废的积分合计">24h到期</th><th class="num" title="48 小时内到期作废的积分合计">48h到期</th><th class="num">最早到期</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
@@ -726,9 +726,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
       <div class="box" id="traeMain" hidden>
         <header>
-          <h3>TRAE 账号 <span class="hint">独立账号池（trae-*.json）：每日自动签到 + token 预刷新；SOLO 限额（1005）自动冷却换号，Work 通道兜底</span></h3>
+          <h3>TRAE 账号 <span class="hint">独立账号池（trae-*.json）：每日自动签到 + token 预刷新；SOLO 限额（1005）自动冷却换号，Work 通道兜底；自动模式按最早积分到期排序（FEFO），↑↓ 手工顺序压过自动排序</span></h3>
           <span class="grow"></span>
           <span class="note" id="traeNote"></span>
+          <button class="xs" id="btnTraeAutoOrder" hidden>恢复自动排序</button>
           <button class="xs" id="btnTraeImportToggle">导入凭证</button>
           <button class="xs" id="btnTraeCheckin">全部签到</button>
           <button class="xs primary" id="btnTraeLogin">Web 登录</button>
@@ -758,7 +759,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <table class="acc">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th><th>积分到期</th><th>Token 到期</th><th class="c-acts"></th>
+            <th>账号</th><th>状态</th><th>积分</th><th class="num" title="24 小时内到期作废的积分合计">24h到期</th><th class="num" title="48 小时内到期作废的积分合计">48h到期</th><th>积分到期</th><th>Token 到期</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="traeBody"></tbody>
         </table>
@@ -1119,9 +1120,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">快过期路由窗口</span>
                 <input name="expiring_soon" placeholder="168h">
                 <span class="hint">窗口内有快过期批次的账号选号权重 ×3（不排序、与金额无关）；0 关闭</span></label>
-              <label class="fld"><span class="lb">会话粘性 TTL</span>
-                <input name="ttl" placeholder="30m">
-                <span class="hint">改动需重启进程</span></label>
             </div>
             <div class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></div>
@@ -1147,6 +1145,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">出站 User-Agent</span>
                 <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
                 <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
+              <label class="fld"><span class="lb">trae 渠道 User-Agent</span>
+                <input name="trae_user_agent" placeholder="留空 = hertz">
+                <span class="hint">仅 trae 模型 SOLO 请求；签到/积分不受影响；需重启</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
@@ -1164,8 +1165,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
-            <div class="switch"><span class="lb">会话粘性路由</span>
-              <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
           </div>
         </div>

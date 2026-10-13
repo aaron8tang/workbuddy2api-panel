@@ -2,7 +2,7 @@
 //
 // 设计约束：Upstash 走公网 TLS，单次 RTT 可能 50~300ms，因此所有写操作都是
 // fire-and-forget（后台 goroutine + 失败仅 debug 日志），读操作只发生在启动时
-// （加载粘性会话镜像、恢复冷却/熔断快照）。内存为主、Redis 为辅。
+// （恢复冷却/熔断快照）。内存为主、Redis 为辅。
 //
 // 未配置 url / 连接失败时降级为 Noop：一切功能照常工作（纯内存模式），
 // 上层只打一条启动警告日志。
@@ -18,7 +18,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// keyTTL 粘性会话镜像 + 状态快照的默认 TTL（redis 侧兜底，防脏数据长期滞留）。
+// keyTTL 状态快照的默认 TTL（redis 侧兜底，防脏数据长期滞留）。
 const keyTTL = 7 * 24 * time.Hour
 
 // writeConcurrencyLimit fire-and-forget 异步写的在途上限（发现 4：写 goroutine
@@ -27,13 +27,6 @@ const writeConcurrencyLimit = 8
 
 // Store 只放本期需要的方法。上下文由实现内部构造（读操作配短超时，写操作 fire-and-forget）。
 type Store interface {
-	// SetBind 异步镜像粘性会话绑定（key→uid），带 TTL。
-	SetBind(key, uid string, ttl time.Duration)
-	// DelBind 异步删除粘性会话绑定。
-	DelBind(key string)
-	// LoadBinds 全量读取粘性会话绑定（key→uid，key 已剥前缀）；仅在启动时调用（同步）。
-	// 供冷启动恢复粘性映射（防重启丢粘性）。
-	LoadBinds() map[string]string
 	// SaveState 异步写池状态 JSON 快照（与本地 state.json 并存，仅作恢复备份）。
 	SaveState(data []byte)
 	// LoadState 读池状态快照；仅在启动时调用（同步）。
@@ -45,7 +38,6 @@ type Store interface {
 }
 
 const (
-	bindPrefix  = "wb2api:bind:"
 	stateKey    = "wb2api:state"
 	readTimeout = 3 * time.Second
 )
@@ -192,33 +184,6 @@ func (u *Upstash) closeClient() error {
 	return u.client.Close()
 }
 
-func bindKey(key string) string { return bindPrefix + key }
-
-// SetBind 异步镜像粘性会话绑定。
-func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
-	if ttl <= 0 {
-		ttl = keyTTL
-	}
-	u.goWrite(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := u.client.Set(ctx, bindKey(key), uid, ttl).Err(); err != nil {
-			log.Printf("[redisstore] debug: SetBind %s: %v", key, err)
-		}
-	})
-}
-
-// DelBind 异步删除粘性会话绑定。
-func (u *Upstash) DelBind(key string) {
-	u.goWrite(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := u.client.Del(ctx, bindKey(key)).Err(); err != nil {
-			log.Printf("[redisstore] debug: DelBind %s: %v", key, err)
-		}
-	})
-}
-
 // SaveState 异步写池状态 JSON 快照。
 func (u *Upstash) SaveState(data []byte) {
 	u.goWrite(func() {
@@ -241,29 +206,9 @@ func (u *Upstash) LoadState() ([]byte, bool) {
 	return v, true
 }
 
-// LoadBinds 全量读取粘性会话绑定（SCAN bind:* 前缀）。
-func (u *Upstash) LoadBinds() map[string]string {
-	out := map[string]string{}
-	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
-	defer cancel()
-	iter := u.client.Scan(ctx, 0, bindPrefix+"*", 200).Iterator()
-	for iter.Next(ctx) {
-		key := iter.Val()
-		v, err := u.client.Get(ctx, key).Result()
-		if err != nil {
-			continue
-		}
-		out[strings.TrimPrefix(key, bindPrefix)] = v
-	}
-	return out
-}
-
 // Noop 纯内存降级：所有方法空实现。
 type Noop struct{}
 
-func (Noop) SetBind(string, string, time.Duration) {}
-func (Noop) DelBind(string)                        {}
-func (Noop) LoadBinds() map[string]string          { return nil }
-func (Noop) SaveState([]byte)                      {}
-func (Noop) LoadState() ([]byte, bool)             { return nil, false }
-func (Noop) Close() error                          { return nil }
+func (Noop) SaveState([]byte)          {}
+func (Noop) LoadState() ([]byte, bool) { return nil, false }
+func (Noop) Close() error              { return nil }

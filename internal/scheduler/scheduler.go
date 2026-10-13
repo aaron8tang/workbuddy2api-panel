@@ -686,3 +686,80 @@ func (s *Scheduler) SetBalanceInterval(d time.Duration) {
 	s.balanceInterval.Store(int64(d))
 	poke(s.rearmBalance)
 }
+
+// RunPackageRefreshNow 并发拉取全部账号的积分包明细并写入池内本地快照
+// （pool.SetCreditPackages）。账号范围口径同 RunBalanceRefreshNow：默认跳过
+// 禁用账号；include_disabled_in_tasks 打开时一并刷新。失败账号保留旧快照
+// （SetCreditPackages 仅成功路径调用），下次每日刷新再补。
+// 供每日定时任务（StartPackageRefresh）与启动预热调用；面板「积分构成」的
+// 实时查询走 panel.packages()（现打上游），两者不共用。
+func (s *Scheduler) RunPackageRefreshNow() {
+	var wg sync.WaitGroup
+	includeDisabled := s.includeDisabledInTasks()
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled && !includeDisabled {
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(a *auth.Auth, uid string) {
+			defer wg.Done()
+			packs, _, _, err := s.cfg.Upstream.CreditPackages(a)
+			if err != nil {
+				log.Printf("pkgrefresh %s: %v", logfmt.Label(uid, a.Nickname), err)
+				return
+			}
+			pkgs := make([]pool.PkgSnapshot, 0, len(packs))
+			for _, cp := range packs {
+				// 失效时刻：ExpiresAt（Unix 毫秒，DeductionEndTime 优先口径）权威；
+				// 0 时回退解析 EndTime（上游墙钟 "2006-01-02 15:04:05"，UTC+8；
+				// RFC3339 形态经 time.Parse 自然兜底）。两者皆缺的包不计入快照。
+				var exp time.Time
+				if cp.ExpiresAt > 0 {
+					exp = time.UnixMilli(cp.ExpiresAt)
+				} else if cp.EndTime != "" {
+					if t, perr := time.ParseInLocation("2006-01-02 15:04:05", cp.EndTime, time.FixedZone("UTC+8", 8*60*60)); perr == nil {
+						exp = t
+					} else if t, perr := time.Parse(time.RFC3339, cp.EndTime); perr == nil {
+						exp = t
+					}
+				}
+				if exp.IsZero() {
+					continue
+				}
+				pkgs = append(pkgs, pool.PkgSnapshot{Remain: cp.Remain, ExpireAt: exp})
+			}
+			s.cfg.Pool.SetCreditPackages(uid, pkgs)
+		}(a, st.UID)
+	}
+	wg.Wait()
+}
+
+// StartPackageRefresh 每日积分包明细刷新（独立 ticker goroutine，ctx 取消即停）。
+// 包明细是慢变量（面额/失效时刻只随发放/到期变化），每天拉一次足够——消耗引发的
+// 余额变化由 NoteModelCost 在本地快照上实时 FEFO 扣减，不打上游。每天 05:20 触发
+// （避开整点任务群：签到 9/21、活跃 10、保活 22、余额刷新每 5 分钟；跨日边界
+// 过期包由快照惰性过滤剔除，05:20 拉取后新一天口径即正确）。
+// interval<=0 不启动（每日一次无热改需求，不做 interval 配置面）。
+func (s *Scheduler) StartPackageRefresh(ctx context.Context) {
+	go func() {
+		for {
+			now := time.Now()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 5, 20, 0, 0, now.Location())
+			if !next.After(now) {
+				next = next.Add(24 * time.Hour)
+			}
+			timer := time.NewTimer(next.Sub(now))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+				s.RunPackageRefreshNow()
+			}
+		}
+	}()
+}

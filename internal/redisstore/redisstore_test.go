@@ -3,7 +3,6 @@ package redisstore
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestNormalizeURL(t *testing.T) {
@@ -50,16 +49,8 @@ func TestNewBadSchemeReturnsNoop(t *testing.T) {
 
 func TestNoopMethods(t *testing.T) {
 	n := Noop{}
-	n.SetBind("k", "u", time.Minute) // 不 panic
-	n.DelBind("k")
 	n.SaveState([]byte("{}"))
 	if _, ok := n.LoadState(); ok {
 		t.Error("Noop.LoadState should report not-found")
-	}
-}
-
-func TestBindKeyPrefix(t *testing.T) {
-	if got := bindKey("abc"); got != bindPrefix+"abc" {
-		t.Errorf("bindKey=%q want prefix", got)
 	}
 }

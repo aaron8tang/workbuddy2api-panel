@@ -60,6 +60,12 @@ type Pool struct {
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
 	preferExpiring bool
+	// accountOrder / accountOrderRank 手工使用顺序（SetAccountOrder 注入；面板账号池
+	// ↑↓ 维护，config pool.account_order 持久化）。非空时 pick() 在最终候选内按名次
+	// 取第一个可用者（顺序即使用优先级，覆盖加权随机）；nil = 自动模式。
+	// 运行态字段，随 config 加载/面板保存热应用，不做状态落盘。
+	accountOrder      []string
+	accountOrderRank  map[string]int
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -191,6 +197,46 @@ func (p *Pool) SetPreferExpiring(enabled bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.preferExpiring = enabled
+}
+
+// SetAccountOrder 注入手工使用顺序（面板账号池 ↑↓ 维护，main 从 config 解析后调用；
+// 空表 = 清除，回到自动加权路由）。uid → 名次快照存两份：accountOrder 保序供
+// AccountOrder() getter 透出面板显示，accountOrderRank 供 pick() O(1) 查名次。
+// 顺序只在 pick() 最终候选（健康/成本层/快过期层过滤后）内生效——排前者先用，
+// 对其不可用（冷却/在途满/触底/层外）自然轮到下一个，不产生「钉死坏号」。
+func (p *Pool) SetAccountOrder(uids []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(uids) == 0 {
+		p.accountOrder = nil
+		p.accountOrderRank = nil
+		return
+	}
+	order := make([]string, 0, len(uids))
+	rank := make(map[string]int, len(uids))
+	seen := make(map[string]bool, len(uids))
+	for _, u := range uids {
+		if u == "" || seen[u] {
+			continue // 去重与空项防御：面板传参异常时不至于建出脏名次表
+		}
+		seen[u] = true
+		rank[u] = len(order)
+		order = append(order, u)
+	}
+	p.accountOrder = order
+	p.accountOrderRank = rank
+}
+
+// AccountOrder 透出当前手工使用顺序（面板 overview 显示用）；空 = 自动模式。
+func (p *Pool) AccountOrder() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.accountOrder) == 0 {
+		return nil
+	}
+	out := make([]string, len(p.accountOrder))
+	copy(out, p.accountOrder)
+	return out
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。

@@ -80,11 +80,6 @@
     "cost_explore_interval": "30m",
     "credit_floor": 100
   },
-  "session_sticky": {
-    "enabled": true,
-    "ttl": "30m",
-    "gc_interval": "5m"
-  },
   "model_groups": {
     "groups": [
       {

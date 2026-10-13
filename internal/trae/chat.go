@@ -6,16 +6,16 @@ package trae
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/promptcache"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/upstream"
@@ -23,7 +23,10 @@ import (
 
 // ChatCompletions 处理一次 trae 渠道对话（已由主路由剥前缀）。
 // bareModel 为 "trae:" 后的裸模型名；"" 表示按组/缺省选择（走 DefaultModel）。
-func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareModel string) {
+// onAccount 选号上报回调（可 nil）：每次轮转/Work 兜底实际选中账号时以
+// (uid, nickname) 回调，server 侧借此把账号填进面板「请求记录」的账号列
+//（trae 子系统不写 reqlog，直填会 import cycle，经回调解耦）。
+func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareModel string, onAccount func(uid, nick string)) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
@@ -34,17 +37,25 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareMo
 		return
 	}
 	var peek struct {
-		Stream bool   `json:"stream"`
-		Model  string `json:"model"`
-		Tools  []any  `json:"tools"`
+		Stream          bool   `json:"stream"`
+		Model           string `json:"model"`
+		Tools           []any  `json:"tools"`
+		ConversationID  string `json:"conversation_id"`
+		ConversationID2 string `json:"conversationId"`
 	}
 	_ = json.Unmarshal(body, &peek)
 
 	// 请求级统计：出口打印表格日志
 	st := newChatStat(time.Now(), body, peek.Stream)
+	st.onAccount = onAccount
 	defer st.done()
 
-	sessionKey := extractSessionKey(r, body)
+	// prompt_cache_key 会话源（P0 费用优化）：promptcache 统一解析链
+	// （body metadata → body 顶层 → 头族 → body user → 前缀指纹），与 CN
+	// 主池（handler.go）共用同一实现——同一工具在 trae 池与 CN 主池间轮询
+	// 账号时，同会话 cache key 跨池恒定。此时 body 仍是原始请求体（下方
+	// setModelInBody 等改写尚未发生）。
+	convID := promptcache.ResolveConversation(r.Header, body)
 
 	// 调用方显式传了裸模型（trae:xxx / 组裁决结果）优先；否则用 body 里的 model。
 	model := bareModel
@@ -76,7 +87,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareMo
 			writeOpenAIError(w, http.StatusForbidden, "work_disabled", "work channel is disabled by configuration")
 			return
 		}
-		handled, err := g.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey)
+		handled, err := g.executeWorkRequest(w, r, body, configName, peek.Stream, st)
 		if !handled {
 			st.status = http.StatusServiceUnavailable
 			msg := "all accounts unavailable for work channel"
@@ -89,6 +100,13 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareMo
 		}
 		return
 	}
+
+	// 请求级诊断：body 顶层非白名单字段扫描（定位 4028 destination-addr 类
+	// 上游拒绝的触发源：agent CLI 自定义字段被透传）。
+	logUnexpectedFields(body)
+	// 请求体画像：定位 3004 类上游拒绝由何种请求特征触发
+	// （超大 body / 超长多轮 / 工具调用历史），与失败时间线对齐。
+	logRequestBodyProfile(body)
 
 	// 在途租约管理：出口统一释放
 	var heldUID string
@@ -108,13 +126,13 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareMo
 	tried := map[string]bool{}
 	var lastErr error
 	for i := 0; i < g.cfg.MaxRotate; i++ {
-		acct := g.cfg.Pool.PickAffinity(sessionKey, tried)
+		acct := g.cfg.Pool.PickExcluding(tried)
 		if acct == nil {
 			break
 		}
 		tried[acct.UID] = true
 		acquireAcct(acct.UID)
-		st.uid = acct.UID
+		st.setAccount(acct.UID, acct.Nickname)
 
 		// token 临近过期 → 先 refresh（持锁重查，避免并发重复轮换；失败冷却换号）
 		refreshed, err := g.cfg.Upstream.RefreshTokenIfNeeded(acct, g.cfg.RefreshSkew)
@@ -133,7 +151,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareMo
 			_ = acct.SaveAtomic()
 		}
 
-		rc, status, respBody, terr := g.cfg.Upstream.ChatStream(acct, body)
+		rc, status, respBody, terr := g.cfg.Upstream.ChatStream(acct, body, convID)
 		if terr != nil {
 			lastErr = terr
 			g.cfg.Pool.RecordError(acct.UID)
@@ -149,7 +167,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareMo
 			case upstream.ErrPlanLimit:
 				g.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, g.cfg.PlanCooldown, "plan 权益不足")
 				// Work 通道兜底消费 work_credits
-				if handled, _ := g.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey); handled {
+				if handled, _ := g.executeWorkRequest(w, r, body, configName, peek.Stream, st); handled {
 					st.status = http.StatusOK
 					return
 				}
@@ -170,15 +188,50 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareMo
 			}
 		}
 		if peek.Stream {
-			g.cfg.Pool.NoteSuccess(acct.UID)
-			g.cfg.Pool.RecordSuccess(acct.UID)
 			st.status = http.StatusOK
-			statsR := newChatStatsReaderSince(rc, st.start)
-			// 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE。
-			_ = upstream.StreamWithError(w, statsR, func(se *upstream.SOLOStreamError) {
+			// HeadCapture 采样上游原始响应体前 2KB：空流诊断用（200+JSON 业务
+			// 错误体在此现形，直见上游真实应答内容）。
+			hc := upstream.NewHeadCapture(rc, 2048)
+			statsR := newChatStatsReaderSince(hc, st.start)
+			// 流内业务错误（1005 plan/5xx 等）→ 冷却账号；早错（未写过任何
+			// 内容 chunk）时 StreamWithError 不写 SSE 直接返回错误 → 此处
+			// 轮转下一账号重试，而非把错误透传给客户端。
+			serr := upstream.StreamWithError(w, statsR, func(se *upstream.SOLOStreamError) {
 				g.handleStreamError(acct.UID, se)
 			})
 			rc.Close()
+			var serrSE *upstream.SOLOStreamError
+			if errors.As(serr, &serrSE) {
+				// 早错：响应头未提交，可安全换号重试（handleStreamError 已
+				// 在回调里记过冷却；此处记 lastErr 供全部耗尽时报错文案）。
+				lastErr = serr
+				continue
+			}
+			if errors.Is(serr, upstream.ErrEmptyStream) {
+				// 空流：上游 200 但零 SSE 事件。此前静默吞掉只发 [DONE] →
+				// agent 端显示「用户已取消」、服务端记 200 成功。现在记账号
+				// 错误（连续空流触发冷却换号）+ 采样诊断日志。
+				g.cfg.Pool.RecordError(acct.UID)
+				g.cfg.Pool.NoteError(acct.UID, g.cfg.ErrThreshold, g.cfg.ErrCooldown)
+				log.Printf("trae_chat uid=%s: upstream empty stream (no SSE events), head=%.300s", acct.UID, hc.Head())
+				st.status = http.StatusBadGateway
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned empty stream")
+				return
+			} else if serr != nil {
+				// 流中途中断（客户端断开/写失败）：不算账号成功，也不吞掉。
+				log.Printf("trae_chat uid=%s: stream aborted: %v", acct.UID, serr)
+				g.cfg.Pool.NoteError(acct.UID, g.cfg.ErrThreshold, g.cfg.ErrCooldown)
+			} else {
+				g.cfg.Pool.NoteSuccess(acct.UID)
+				g.cfg.Pool.RecordSuccess(acct.UID)
+				// 积分预扣：按 SOLO 计费倍率 × total_tokens 在内存即时扣减
+				//（FEFO 逐包），面板 24h/48h 到期列与选号权重下一次调用即反映；
+				// 估算偏差由 CreditsLoop 定期用上游权威余量差校准收敛。倍率未知
+				//（RateOf=0）时跳过——扣减换算瞎猜会污染面板数字与选号。
+				if tt, ok := statsR.UsageTokens(); ok {
+					g.cfg.Pool.DeductCredits(acct.UID, g.RateOf(configName), int64(tt))
+				}
+			}
 			if toks, ok := statsR.Tokens(); ok {
 				st.toks = toks
 			}
@@ -201,19 +254,30 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareMo
 				}
 				continue
 			}
+			if errors.Is(err, upstream.ErrEmptyStream) {
+				// 空流（上游 200 但零 SSE 事件）：按上游账号级故障处理，计错误
+				// 冷却并轮转下一账号——非流式路径尚未写响应，可以安全换号。
+				lastErr = err
+				g.cfg.Pool.NoteError(acct.UID, g.cfg.ErrThreshold, g.cfg.ErrCooldown)
+				continue
+			}
 			st.status = http.StatusBadGateway
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			return
 		}
 		g.cfg.Pool.NoteSuccess(acct.UID)
 		g.cfg.Pool.RecordSuccess(acct.UID)
+		// 积分预扣（非流式）：口径与流式路径一致，total_tokens × 倍率即时扣减。
+		if tt := usageTotalTokens(resp); tt > 0 {
+			g.cfg.Pool.DeductCredits(acct.UID, g.RateOf(configName), int64(tt))
+		}
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	// 所有账号耗尽/冷却，尝试 Work 通道兜底消费 work_credits
-	if handled, _ := g.executeWorkRequest(w, r, body, configName, peek.Stream, sessionKey); handled {
+	if handled, _ := g.executeWorkRequest(w, r, body, configName, peek.Stream, st); handled {
 		st.status = http.StatusOK
 		return
 	}
@@ -228,6 +292,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareMo
 // handleStreamError 流式响应中的上游业务错误 → pool 冷却状态机。
 // 1005 / 4008 plan 权益不足 → 长冷却；4011 限流 → 短冷却；其余（5xx/参数错误等）→ 累计错误冷却。
 func (g *Gateway) handleStreamError(uid string, se *upstream.SOLOStreamError) {
+	log.Printf("trae_chat uid=%s: stream error code=%d msg=%.200s", uid, se.Code, se.Msg)
 	switch se.Kind() {
 	case upstream.ErrPlanLimit:
 		g.cfg.Pool.Cooldown(uid, pool.CoolPlan, g.cfg.PlanCooldown, "plan 权益不足")
@@ -317,54 +382,6 @@ func setModelInBody(body []byte, configName string) []byte {
 	return out
 }
 
-// extractSessionKey 从 HTTP 请求头或 OpenAI 请求体中提取会话标识，用于多轮对话粘性路由。
-// 优先级：
-// 1. HTTP 请求头 (X-Session-ID / X-Conversation-ID / Session-Id)
-// 2. 请求体中的 user 字段
-// 3. 多轮对话前缀特征指纹 (提取 messages[0] 与 messages[1] 角色与内容计算 SHA-256)
-func extractSessionKey(r *http.Request, body []byte) string {
-	if sid := r.Header.Get("X-Session-ID"); sid != "" {
-		return sid
-	}
-	if cid := r.Header.Get("X-Conversation-ID"); cid != "" {
-		return cid
-	}
-	if sid := r.Header.Get("Session-Id"); sid != "" {
-		return sid
-	}
-
-	var req struct {
-		User     string `json:"user"`
-		Messages []struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
-	}
-	if err := json.Unmarshal(body, &req); err == nil {
-		if req.User != "" {
-			return req.User
-		}
-		if len(req.Messages) > 0 {
-			// 在同一多轮对话流中：系统提示词(若有)和首轮用户提问在所有轮次中均保持恒定。
-			h := sha256.New()
-			if req.Messages[0].Role == "system" {
-				h.Write([]byte("sys:"))
-				h.Write(req.Messages[0].Content)
-			}
-			// 找到首条非系统消息（即首轮用户提问）
-			for _, m := range req.Messages {
-				if m.Role != "system" {
-					h.Write([]byte(m.Role + ":"))
-					h.Write(m.Content)
-					break
-				}
-			}
-			return "fp:" + hex.EncodeToString(h.Sum(nil)[:8])
-		}
-	}
-	return ""
-}
-
 // ---------------------------------------------------------------------------
 // Work 通道
 // ---------------------------------------------------------------------------
@@ -372,12 +389,14 @@ func extractSessionKey(r *http.Request, body []byte) string {
 // executeWorkRequest 使用账号池多账号动态轮转调度执行 Work 通道请求。
 // 调度与容灾策略：
 // 1. 检查 Work 通道是否被配置禁用；
-// 2. 根据可用 work_credits 降序择优选取健康账号（支持 sessionKey 会话粘性，排除已尝试过的账号）；
+// 2. 按手工使用顺序/work_credits 择优选取健康账号（排除已尝试过的账号，无会话粘性）；
 // 3. 检查并按需预刷新 token；
 // 4. 发起 ChatStream 调用（在 Auto 模式下优先 Native 直连，失败平滑降级 Bridge）；
 // 5. 若发生故障（网络错误/429限流/401会话失效/额度不足），进入 pool 对应冷却/禁用状态机，并自动轮转下一账号；
 // 6. 成功响应后，异步触发积分探测，更新账号 work_credits 状态。
-func (g *Gateway) executeWorkRequest(w http.ResponseWriter, r *http.Request, body []byte, model string, stream bool, sessionKey string) (bool, error) {
+// st 为调用方的请求级统计（可 nil）：选中账号时经 setAccount 上报，
+// 使 Work 通道请求的面板账号列与 trae stdout 行同主通道一样有账号。
+func (g *Gateway) executeWorkRequest(w http.ResponseWriter, r *http.Request, body []byte, model string, stream bool, st *chatStat) (bool, error) {
 	if g.cfg.WorkMode == upstream.WorkModeDisabled || (g.cfg.WorkClient != nil && g.cfg.WorkClient.Mode() == upstream.WorkModeDisabled) {
 		return false, errors.New("work channel is disabled by configuration")
 	}
@@ -391,11 +410,14 @@ func (g *Gateway) executeWorkRequest(w http.ResponseWriter, r *http.Request, bod
 	var lastErr error
 
 	for i := 0; i < g.cfg.MaxRotate; i++ {
-		acct := g.cfg.Pool.PickWorkAffinity(sessionKey, tried)
+		acct := g.cfg.Pool.PickWorkExcluding(tried)
 		if acct == nil {
 			break
 		}
 		tried[acct.UID] = true
+		if st != nil {
+			st.setAccount(acct.UID, acct.Nickname)
+		}
 
 		refreshed, err := g.cfg.Upstream.RefreshTokenIfNeeded(acct, g.cfg.RefreshSkew)
 		if err != nil {

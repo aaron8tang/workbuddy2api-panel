@@ -141,6 +141,9 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 		}
 		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsDetailed
 		// 重新写入，不能沿用旧窗口/旧批次的缓存。
+		// 注意：包快照（e.pkgs）**不清**——余额刷新每几分钟跑一次，清了会把每日
+		// 拉取的快照打成空白；pkgs 由每日拉取任务 SetCreditPackages 权威重写，
+		// 由 NoteModelCost 实时扣减，与本处聚合值生命周期正交（见 packages.go）。
 		e.creditsExpiring = 0
 		e.creditsEarliestExpiry = time.Time{}
 		e.creditsEarliestRemaining = 0
@@ -241,6 +244,9 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 				e.creditsEarliestRemaining -= d
 			}
 		}
+		// 包快照 FEFO 实时扣减：从最早失效的包逐包扣，让 24h/48h 到期窗口随消耗
+		// 实时收敛（否则快照里的到期批次要等每日拉取才更新，展示口径脱节）。
+		consumePkgsLocked(e, d)
 	}
 	if e.modelCost == nil {
 		e.modelCost = make(map[string]modelCostEntry)
@@ -329,51 +335,9 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 	return nil
 }
 
-// AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
-// 供会话粘性路由（internal/session）做快路径命中校验 + 双段分配；无可用返回空切片。
-func (p *Pool) AvailableUIDs() []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
-		if !e.healthy(now) {
-			continue
-		}
-		if p.inFlightFull(e) {
-			continue
-		}
-		uids = append(uids, uid)
-	}
-	sort.Strings(uids)
-	return uids
-}
-
-// AvailableUIDsForModel 同 AvailableUIDs，但把健康口径换成 healthyForModel：
-// 在该模型上被 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入（模型豁免）。
-// 供会话粘性按模型分配与命中校验；model 为空时等价于 AvailableUIDs。
-func (p *Pool) AvailableUIDsForModel(model string) []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
-		if !e.healthyForModel(now, model) {
-			continue
-		}
-		if p.inFlightFull(e) {
-			continue
-		}
-		uids = append(uids, uid)
-	}
-	sort.Strings(uids)
-	return uids
-}
-
-// PickByUIDForModel 同 PickByUID，但用 healthyForModel 校验：绑定号在当前模型被
-// 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换。
-// 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
-// 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
+// PickByUIDForModel 按 uid 直取账号（handler 模型组「组钉账号」路径专用），但用
+// healthyForModel 校验：钉定账号在当前模型被 6004 限流时返回 nil，让调用方跳过
+// 该号回落下一候选。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -385,37 +349,14 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	if !e.healthyForModel(now, model) {
 		return nil
 	}
-	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
-	// （判据含上游目录倍率兜底，realm 取账号所属域——粘性号已确定，无需外部传入）。
-	// 返回 nil 后 handler 侧解绑粘性（unbindSticky）走普通轮换换号，粘性号回血
-	// 后下次会话重新绑定。
-	// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
-	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
+	// 积分保底：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
+	// （判据含上游目录倍率兜底，realm 取账号所属域——组钉号已确定，无需外部传入）。
+	// 返回 nil 后 handler 侧跳过该号走普通轮换换号，账号回血后组钉路径恢复出票。
+	// 日志频次：天然每请求至多一条——首次返回 nil 即跳过，后续轮转不再调入本路径
+	// （无需额外节流）；组钉续用中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
 	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
-		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
+		log.Printf("WARN: [pool] credit floor: pinned acct=%s model=%s credits=%d < floor=%d, skip (paid model held out)",
 			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
-		return nil
-	}
-	if p.inFlightFull(e) {
-		return nil
-	}
-	e.lastUsed = now
-	p.pickSeq++
-	e.usedSeq = p.pickSeq
-	return e.a
-}
-
-// PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
-// 否则返回 nil。供会话粘性路由命中校验与直取使用。
-func (p *Pool) PickByUID(uid string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return nil
-	}
-	now := time.Now()
-	if !e.healthy(now) {
 		return nil
 	}
 	if p.inFlightFull(e) {
@@ -572,6 +513,19 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		InFlight:                 int(e.inFlight.Load()),
 		BreakerFails:             e.fails,
 		BreakerUntil:             e.breakerUntil,
+	}
+	// 包快照派生值（24h/48h 到期窗口 + 最早批次日期）：NoteModelCost 实时扣减 +
+	// 每日拉取刷新，供前端主池表格展示（无快照时省略，前端回退旧数据源）。
+	if len(e.pkgs) > 0 {
+		if v, ok := pkgsExpiringFor(e.pkgs, 24, now); ok {
+			st.Exp24h = v
+		}
+		if v, ok := pkgsExpiringFor(e.pkgs, 48, now); ok {
+			st.Exp48h = v
+		}
+		if day, ok := pkgsEarliestDay(e.pkgs, now); ok {
+			st.EarliestExpiryDay = day
+		}
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。

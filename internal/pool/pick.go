@@ -51,7 +51,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	if reqModel != "" {
 		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
 	}
-	// floorBlocked 积分保底拦截判定（实现在 floorBlockedForRealmModel，与粘性路径共用）：
+	// floorBlocked 积分保底拦截判定（实现在 floorBlockedForRealmModel，与组钉直取路径共用）：
 	// 触底 + 收费（本地实测台账 或 上游目录倍率）即拦；免费/未知倍率不受限。
 	floorBlocked := func(e *entry) bool { return p.floorBlockedForRealmModel(e, reqModel, realm, now) }
 	var cands []*entry
@@ -152,17 +152,49 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// 权重只算一次：顶 5 截断要排序，若在 sort 比较器里现算 weightOf 会翻成 O(n log n) 次
 	// 冗余浮点计算（46 账号约 500 次）。先做 O(n) 预计算，再按 (权重, uid) 排序。
 	// costTier/modelCostOf 同样每候选只算一次（存入 tier/cost1k），比较器只读缓存字段。
+	// 手工使用顺序（pool.account_order，面板账号池 ↑↓ 维护）：候选带名次快照。
+	// 名次语义：order 内按位置；未覆盖的账号一律垫底（= len(order)，彼此并列、
+	// 垫底层内部仍按成本单价/权重排序）。order 为空时 rank 恒 0，比较器与截断
+	// 全部退化为既有行为（零回归）。
+	orderRank := p.accountOrderRank
+	orderBase := len(orderRank)
 	type weighted struct {
 		e      *entry
 		w      float64
 		tier   int
 		cost1k float64
+		rank   int
 	}
 	ws := make([]weighted, 0, len(cands))
 	for _, e := range cands {
 		ti, ci := costTier(e)
 		if ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci})
+			r := orderBase
+			if v, ok := orderRank[e.a.UID]; ok {
+				r = v
+			}
+			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci, rank: r})
+		}
+	}
+	// 快过期硬优先（issue：31 天后才到期的号也被抽中）：候选中存在有效快过期账号时，
+	// 只在快过期账号内选号——「先用掉要过期的积分」从 ×3 软加权升级为硬过滤。
+	// 软加权的问题（实测）：7 号池里远期号靠闲置/余额权重仍能进 top5，每个新会话
+	// ~10% 概率抽中远期号（14:07 素素实案），粘性再锁 30 分钟。硬过滤后远期号
+	// 中签率为 0；快过期号全部不健康/触底被拦时 ws 内无 expiringNow 命中，本段
+	// 自然失效回退全集，不会无号可用。prefer_expiring=false 整段跳过（旧语义）。
+	// 注：此时 ws 已过成本分层，故硬优先作用于同成本层内——限免层存在时先保免费，
+	// 再在免费层内先用快过期号（共享观测使全池同层，两层叠加语义一致）。
+	if p.preferExpiring && len(ws) > 0 {
+		n := 0
+		for i := range ws {
+			if expiringNow(ws[i].e, now) {
+				ws[n] = ws[i]
+				n++
+			}
+		}
+		if n > 0 && n < len(ws) {
+			log.Printf("[pool] expiring hard tier model=%s realm=%q kept=%d/%d candidates", reqModel, realm, n, len(ws))
+			ws = ws[:n]
 		}
 	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
@@ -171,7 +203,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// 截断会让 uid 靠后的账号永远进不了 top5（等权重账号被字典序饿死、LRU 兜底
 	// 又只在 top5 内转——惊群集中单号的根因）。洗牌用独立的 time-seeded 源，
 	// 只在截断边界制造等权重随机次序，不影响加权抽签本身的确定性。
-	if len(ws) > 5 {
+	// 手工顺序模式下洗牌无意义（rank 主序已定，洗牌只动同 rank 的并列关系），
+	// 跳过以保持顺序语义纯净。
+	if len(orderRank) == 0 && len(ws) > 5 {
 		eq := false
 		for i := 1; i < len(ws); i++ {
 			if ws[i].w == ws[0].w {
@@ -185,6 +219,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		}
 	}
 	sort.SliceStable(ws, func(i, j int) bool {
+		// 手工使用顺序最高优先：order 内名次小者在前（顺序即使用优先级）。
+		if ws[i].rank != ws[j].rank {
+			return ws[i].rank < ws[j].rank
+		}
 		// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
 		// 在前；tier 0/1 层 cost1k 恒 0，本比较退化为权重比较）——读缓存字段不现算。
 		if ws[i].cost1k != ws[j].cost1k {
@@ -202,7 +240,15 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// candsAll 保留截断前的全候选（权重降序），供 LRU 兜底在全量范围选最旧者，
 	// 避免 top5 字典序截断把等权重靠后账号饿死（惊群根因之一）。
 	candsAll := cands
-	if len(cands) > 5 {
+	if len(orderRank) > 0 {
+		// 手工顺序模式：只保留名次最优的一个——顺序即优先级，第一名对当前模型
+		// 不可用（冷却/在途满/触底/成本层与快过期层过滤）时根本进不了 cands，
+		// 自然轮到下一名。截 1 而不是截 5：eligible/LRU 机制照常复用（minPickGap
+		// 防并发撞号仍生效），且 100ms 窗口外的每个请求都严格命中顺序第一名。
+		if len(cands) > 1 {
+			cands = cands[:1]
+		}
+	} else if len(cands) > 5 {
 		cands = cands[:5]
 	}
 	var e *entry
@@ -267,8 +313,8 @@ func (p *Pool) sharedModelCost(model string, now time.Time) (modelCostEntry, boo
 	return best, found
 }
 
-// floorBlockedForModel 积分保底拦截判定（pick 普通轮换与 PickByUIDForModel 粘性
-// 路径的单一事实来源）：floor>0 且账号触底（credits < floor）且该模型**收费**
+// floorBlockedForModel 积分保底拦截判定（pick 普通轮换与 PickByUIDForModel 组钉
+// 直取路径的单一事实来源）：floor>0 且账号触底（credits < floor）且该模型**收费**
 // 时为真。
 //
 // 收费判据两级（任一成立即判收费 → 拦）：
@@ -367,7 +413,7 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	}
 	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
-	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）
+	// 兜底同样是「选中」，必须与 pick() 正常路径、组钉直取路径（PickByUIDForModel）
 	// 一样推进 usedSeq/pickSeq：否则被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
 	// LRU 兜底（按 usedSeq 取最旧）眼里永远是「最旧」，刚被用过就被立刻再选——
 	// 防集中/防惊群失效（entry.usedSeq 契约：每次被选中时取 p.pickSeq 自增值）。

@@ -26,6 +26,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelgroup"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/promptcache"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
@@ -39,10 +40,6 @@ type Config struct {
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
-	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
-	Session *session.Router
-	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
-	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
 	RedisMode    string
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
@@ -259,10 +256,6 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
-	sticky := 0
-	if h.cfg.StickyCount != nil {
-		sticky = h.cfg.StickyCount()
-	}
 	redisMode := h.cfg.RedisMode
 	if redisMode == "" {
 		redisMode = "noop"
@@ -284,7 +277,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			"cn":     countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
 			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
 		},
-		"sticky_sessions": sticky,
+		"sticky_sessions": 0, // 会话粘性已移除：统一 cache key 后粘性无收益，保留键位兼容面板
 		"redis_mode":      redisMode,
 		// model_locks 当前有未过期模型级限流的 (域, 模型) 全清单：账号池视图回答
 		// 「哪些号不能用」，本键回答「哪些模型不能用、锁了几个号、还要锁多久」。
@@ -639,7 +632,10 @@ func (h *Handler) groupLookup(name string) (modelgroup.Group, bool) {
 	return h.cfg.ModelGroups.Lookup(name)
 }
 
-// groupModelPriority 返回组内模型的**生效优先级**顺序。跨渠道主键：「谁先到期
+// groupModelPriority 返回组内模型的**生效优先级**顺序。最高键（boost）：主池
+// 有多个健康账号存在 24h 内到期积分时（CountExpiring24h >= 2），所有 trae 条目
+// 整体排到 cn/global 条目之前——主池积分马上要作废，先用掉，好过被 trae 低价
+// 倍率吸走后白白过期。此前 boost 不生效时退回常规排序。跨渠道主键：「谁先到期
 // 用谁」——各条目按所属渠道的最早积分到期时刻升序（workbuddy 取主池健康账号的
 // 最早到期批次；trae 按月度重置日估算，见 Gateway.EarliestCreditExpiry）。单渠道
 // 组内所有条目共享同一到期时刻，该键恒平局，退化为原有倍率序，行为不变。次键：
@@ -651,12 +647,18 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 	if g == nil || len(g.Models) == 0 {
 		return nil
 	}
+	// boost 判定（组级一次）：主池健康账号中 ≥2 个有 24h 内到期积分 → trae 整体排前。
+	boostTrae := false
+	if h.cfg.Pool != nil && h.cfg.Pool.CountExpiring24h("") >= 2 {
+		boostTrae = true
+	}
 	type cand struct {
 		model  string
 		rate   float64
 		known  bool
 		expiry time.Time // 所属渠道最早积分到期时刻
 		expOK  bool
+		boost  bool // trae 条目在 boost 生效时置位（最高优先级键）
 	}
 	// 渠道到期时刻按 realm 缓存：组内同域条目共享一次查询。
 	expCache := map[string]struct {
@@ -688,15 +690,33 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 		entry, _ := modelgroup.SplitEffort(m)
 		realm, bare := resolveModel(entry)
 		rate := ""
-		if h.cfg.Upstream != nil {
+		if realm == "trae" {
+			// trae 域倍率数据源与 CN 目录不同：get_detail_param 的
+			// display_contact_config.consumption_rate.rate（TraeCN 桌面端展示的
+			// 官方倍率，如 glm-5.3-flash=0.06 / glm-5.3=0.78），上游无观测时也
+			// 可用——它是静态目录属性而非用量观测，走动态模型缓存（1h TTL）。
+			if h.cfg.Trae != nil {
+				if r := h.cfg.Trae.RateOf(bare); r > 0 {
+					rate = strconv.FormatFloat(r, 'f', -1, 64)
+				}
+			}
+		} else if h.cfg.Upstream != nil {
 			rate = h.cfg.Upstream.ModelRate(realm, bare)
 		}
 		v, err := strconv.ParseFloat(rate, 64)
 		expiry, expOK := channelExpiry(realm)
-		cands = append(cands, cand{model: entry, rate: v, known: err == nil, expiry: expiry, expOK: expOK})
+		cands = append(cands, cand{
+			model: entry, rate: v, known: err == nil,
+			expiry: expiry, expOK: expOK,
+			boost: boostTrae && realm == "trae",
+		})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		a, b := cands[i], cands[j]
+		// 最高键：主池多账号 24h 内到期时 trae 整体排前（见函数注释）。
+		if a.boost != b.boost {
+			return a.boost
+		}
 		// 主键：跨渠道谁先到期用谁。未知（渠道关闭/无到期信号）排已知之后。
 		if a.expOK != b.expOK {
 			return a.expOK
@@ -724,7 +744,7 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 // 口径用 CountsDetailedForRealm 的 healthy（非禁用/非暂停/非冷却），刻意**不含
 // 在途占满**：default 模型选取决定整个会话的走向，应基于稳定信号（停号/禁用/
 // 冷却是管理级状态），秒级在途波动交给后续选号逻辑自己报错，否则一波并发就会
-// 让 default 在渠道间来回漂移、破坏粘性会话的模型一致性。
+// 让 default 在渠道间来回漂移、破坏同会话多轮对话的模型一致性。
 func (h *Handler) realmServable(realm string) bool {
 	if h.cfg.Pool == nil {
 		return false
@@ -825,7 +845,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 	}
 	_ = json.Unmarshal(body, &peek)
 
-	// 模型组的模型裁决（在 realm 解析与粘性解析之前——后续选号/粘性/出站重写
+	// 模型组的模型裁决（在 realm 解析之前——后续选号/出站重写
 	// 都要基于裁决后的最终模型名）：
 	//   1. model 缺省、等于组名、或字面量 "default" → 按组内模型生效优先级（积分
 	//      倍率升序、免费在前，同倍率按书写顺序）取默认模型（见 groupDefaultModel），
@@ -873,7 +893,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 	declaredTools := upstream.ToolNameAllowlist(body)
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
-	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
+	// bareModel 用于选号/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
 	modelRate := ""
@@ -908,7 +928,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 		// body 已完整读出且可能经组裁决改写（setModelField/effort 注入）——回填给
 		// trae 网关复用（其 ChatCompletions 自行读 body），不重复声明 r.Body 语义。
 		r.Body = io.NopCloser(bytes.NewReader(body))
-		h.cfg.Trae.ChatCompletions(w, r, bareModel)
+		// 账号上报：trae 子系统自含选号/轮转（外层 chatStat 不经过选号），选中账号
+		// 经此回调回写本请求的 st.uid/st.nick——reqlog.Event.Account 从这里取值，
+		// 面板「请求记录」的账号列才能显示 trae 账号（此前恒为空显示 "—"）。
+		h.cfg.Trae.ChatCompletions(w, r, bareModel, func(uid, nick string) {
+			st.uid, st.nick = uid, nick
+		})
 		return
 	}
 
@@ -918,23 +943,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
 
-	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
-	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
-	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
+	// 会话键仅用于轮级/会话级聚合键派生（ConversationRequestID）。账号粘性已
+	// 整体移除：统一 cache key 后粘性无缓存收益，反而把请求钉死在临期账号上
+	//（chenwei 实案）——所有请求一律走 pick() 加权轮换（临期硬优先 + FEFO）。
 	sessKey := session.ExtractKey(body)
-	stickyUID := ""
-	if h.cfg.Session != nil && sessKey != "" {
-		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
-		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
-			stickyUID = uid
-		}
-	}
-	// 模型组钉了账号清单时，粘性号必须也在清单内，否则本请求忽略粘性（保留绑定，
-	// 组内号成功后 Bind 会把会话重绑到组内号，下一跳自然对齐）。
-	if stickyUID != "" && grp != nil && len(grp.Accounts) > 0 && !grp.HasAccount(stickyUID) {
-		stickyUID = ""
-	}
 
 	// 轮级聚合键：按 body 里最后一条 user 消息派生（同轮内所有上游调用同键，
 	// 换 user 消息换键）。#170 起带会话键的客户端也统一走轮级（对齐官方桌面 CLI
@@ -947,6 +959,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 	// gateway_hint 判定所需的请求形态（image_url part）：在改写前取（与 turnKey
 	// 同理）。11133「模型不支持图片」指向的前提。
 	reqHasImage := hasImagePart(body)
+
+	// prompt_cache_key 会话源（P0/P1 共享实现）：promptcache 统一解析链
+	//（body metadata → 顶层 → 头族 → user → 前缀指纹），必须在下方 prompt.
+	// Rewrite 之前按原始 body 计算（改写会动 messages）。与 SOLO 通道（trae/
+	// chat.go）共用同一实现——同一工具在两池间轮询账号时，同会话 cache key
+	// 跨池恒定。
+	cacheConv := promptcache.ResolveConversation(r.Header, body)
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
@@ -961,20 +980,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 			heldUID = ""
 		}
 	}
-	// unbindSticky 解绑当前会话粘性号（stickyUID 非空时）。供「粘性号不可用/被抢」与 fail 共用。
-	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
-	unbindSticky := func() {
-		if stickyUID != "" {
-			h.cfg.Session.Unbind(sessKey)
-			stickyUID = ""
-		}
-	}
-	// fail 在轮转失败分支统一：释放租约 + 若失败号正是粘性号则解绑（下次请求重新分配）。
+	// fail 在轮转失败分支统一释放租约（粘性已移除，无绑定需解绑）。
 	fail := func(uid string) {
 		releaseHeld()
-		if stickyUID != "" && uid == stickyUID {
-			unbindSticky()
-		}
 	}
 	// ttfb 首 token 等待（仅流式有观测；非流式传 0 = 无观测，速率不扣减）。
 	// 显式入参而不是读 st.ttfb：后者在流式分支里是**调用之后**才赋值的，
@@ -1078,7 +1086,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 	//     粘性 key 进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID），
 	//     无 user 消息时退化成本请求级随机——轮转内捕获一次即共享；
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
-	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	chatMeta := upstream.ChatMeta{
+		ConversationID:      session.ResolveConversationID(body),
+		CacheConversationID: cacheConv,
+	}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if turnKey != "" && sessKey != "" {
@@ -1097,23 +1108,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
-		var acct *auth.Auth
-		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
-			if acct == nil || (realm != "" && acct.Realm() != realm) {
-				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
-				// 本次回落普通轮换。
-				unbindSticky()
-				acct = nil
-			}
-		}
-		if acct == nil {
-			// 组感知选号：组钉了账号 → 按组内顺序逐个尝试（不回落池外）；
-			// 未钉 → 模型感知 + realm 感知普通轮换（模型非空时启用 6004 模型级
-			// 冷却豁免 healthyForModel，realm 谓词过滤跨域账号），与主路由同口径。
-			acct = h.pickForGroup(grp, tried, bareModel, realm)
-		}
+		// 选号：组感知轮换（粘性已移除，每次请求即时择优）。组钉了账号 → 按组内
+		// 顺序逐个尝试（不回落池外）；未钉 → 模型感知 + realm 感知加权轮换（模型
+		// 非空时启用 6004 模型级冷却豁免 healthyForModel，realm 谓词过滤跨域账号）。
+		acct := h.pickForGroup(grp, tried, bareModel, realm)
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
 			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
@@ -1131,11 +1129,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 		if !h.cfg.Pool.Acquire(acct.UID) {
-			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
-			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
-			if stickyUID != "" && acct.UID == stickyUID {
-				unbindSticky()
-			}
 			if !rotateBackoff(i, r.Context()) {
 				// 客户端已断连：换号重试无意义，终止轮转走末端错误透传。
 				break
@@ -1367,21 +1360,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 				st.outcome = reqlog.OutcomeInterrupted
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.UID)
-				}
 			default:
-				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
+				// 真成功：这一跳读完且上游没有报错，才记成功。
 				st.outcome = reqlog.OutcomeSuccess
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 				// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-				// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
-				// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.UID)
-				}
 			}
 			credit, hasCredit := stats.Credit()
 			if hit, miss, ok := stats.CacheTokens(); ok {
@@ -1458,12 +1443,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 		st.status = http.StatusOK
 		st.outcome = reqlog.OutcomeSuccess
 		st.toks = completionTokens(resp)
-		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
+		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功。
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
-		}
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if hasCredit {
 			st.credit = credit

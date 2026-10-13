@@ -17,11 +17,12 @@ import (
 
 // Config 调度器依赖。
 type Config struct {
-	Pool         *pool.Pool
-	Upstream     *upstream.Client
-	CheckinHour  int           // 每日签到小时，默认 9
-	RefreshHours []int         // token 预刷新小时，默认 [3]
-	RefreshSkew  time.Duration // 预刷新窗口，默认 24h
+	Pool              *pool.Pool
+	Upstream          *upstream.Client
+	CheckinHour       int           // 每日签到小时，默认 9
+	RefreshHours      []int         // token 预刷新小时，默认 [3]
+	RefreshSkew       time.Duration // 预刷新窗口，默认 24h
+	CreditRefreshEvery time.Duration // 积分明细定点刷新间隔，默认 6h
 }
 
 // Scheduler 调度器。
@@ -39,6 +40,9 @@ func New(cfg Config) *Scheduler {
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 24 * time.Hour
+	}
+	if cfg.CreditRefreshEvery <= 0 {
+		cfg.CreditRefreshEvery = 6 * time.Hour
 	}
 	return &Scheduler{cfg: cfg}
 }
@@ -142,6 +146,44 @@ func (s *Scheduler) RetryLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// RunCreditsNow 立即对所有账号拉取一次积分权益包明细（EntPacks）。
+// 与签到路径共享 refreshCredits：SetCreditExpiry 覆盖内存快照时触发权威余量差
+// 校准（pool.calibrateLocked），使 DeductCredits 的换算系数逐步收敛到真实值。
+func (s *Scheduler) RunCreditsNow() {
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.RefreshTokenValue() == "" {
+			continue
+		}
+		s.refreshCredits(st, a)
+	}
+}
+
+// CreditsLoop 积分明细定点刷新循环：启动即刷一次（拉起时尽快恢复面板临期数据
+// 与校准样本窗口），随后按 CreditRefreshEvery 周期刷新；ctx 取消时返回。
+// 调用与扣减的闭环：每笔成功调用在内存按倍率×tokens 预扣（pool.DeductCredits，
+// FEFO 逐包扣减、24h/48h 到期列即时下降），本循环定期用上游权威余量校准系数。
+func (s *Scheduler) CreditsLoop(ctx context.Context) {
+	interval := s.cfg.CreditRefreshEvery
+	if interval <= 0 {
+		interval = 6 * time.Hour
+	}
+	s.RunCreditsNow()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.RunCreditsNow()
+		}
+	}
+}
+
 // checkinAccount 单账号一次 status→claim。9074 时轮换设备并记录退避
 // （status 限流换 ID 重查一次，claim 限流等退避到期）；成功/已签到清零退避。
 func (s *Scheduler) checkinAccount(st pool.Status, a *auth.Auth) {
@@ -223,14 +265,16 @@ func (s *Scheduler) refreshCredits(st pool.Status, a *auth.Auth) {
 	}
 	remain := int64(0)
 	earliest := int64(0)
+	var packsSnapshot []pool.CreditPack
 	for _, p := range packs {
 		remain += p.Limit - int64(p.Used)
 		if p.ExpireAt > 0 && (earliest == 0 || p.ExpireAt < earliest) {
 			earliest = p.ExpireAt
 		}
+		packsSnapshot = append(packsSnapshot, pool.CreditPack{ExpireAt: p.ExpireAt, Remain: float64(p.Limit) - p.Used})
 	}
 	s.cfg.Pool.ReenableIfCredits(st.UID, remain)
-	s.cfg.Pool.SetCreditExpiry(st.UID, earliest)
+	s.cfg.Pool.SetCreditExpiry(st.UID, earliest, packsSnapshot)
 }
 
 // RunRefreshNow 立即对所有账号刷新 token；session 失效的自动禁用。

@@ -26,7 +26,6 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	traeauth "github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
 	traepool "github.com/linguo2625469/workbuddy2api-panel/internal/trae/pool"
@@ -109,32 +108,15 @@ func main() {
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
+	p.SetAccountOrder(cfg.Pool.AccountOrder)             // 手工使用顺序（空 = 自动加权）
 
-	// 会话粘性路由（可配关闭）。
-	var sessRouter *session.Router
+	// redisstore 模式观测（"upstash" / "noop"，供 /status 透出）。
+	// 会话粘性已整体移除：prompt_cache_key 统一后同会话跨账号/跨池 cache key 恒定，
+	// 粘性无缓存收益，反而把请求钉死在临期账号上（chenwei 实案）——所有请求一律
+	// 走 pick() 加权轮换（临期硬优先 + FEFO），session.Router 装配随之摘除。
 	redisMode := "noop"
 	if _, ok := store.(redisstore.Noop); !ok {
 		redisMode = "upstash"
-	}
-	if cfg.SessionSticky.Enabled {
-		sessRouter = session.New(session.Config{
-			TTL:        cfg.SessionTTL,
-			GCInterval: cfg.SessionGCInterval,
-			Store:      store,
-			Available:  p.AvailableUIDs,
-			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
-			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
-			AvailableForModel: realmAwareAvailableForModel(p),
-		})
-		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
-		sessRouter.StartGC()
-		defer sessRouter.StopGC()
-	}
-	sessCount := func() int {
-		if sessRouter != nil {
-			return sessRouter.Count()
-		}
-		return 0
 	}
 
 	up := upstream.New()
@@ -198,6 +180,7 @@ func main() {
 		tp.SyncToDir(traeAuths) // 与 trae-*.json 对齐：加入新账号、剔除已删文件账号（状态保留）
 
 		tu := traeupstream.New()
+		tu.UserAgent = cfg.Trae.UserAgent // 空 = 内置默认 "hertz"（SOLO 对话/模型路径）
 		traeGw = trae.New(trae.Config{
 			Pool:            tp,
 			Upstream:        tu,
@@ -346,7 +329,6 @@ func main() {
 		AuthDir:     cfg.AuthDir,
 		APIKey:      cfg.APIKey,
 		RedisMode:   redisMode,
-		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
 		// 模型组注册表：面板「模型与档位 → 模型组」在线编辑后经 SaveConfig 热替换
@@ -375,8 +357,6 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
 		Panel:        pn,
@@ -399,12 +379,22 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
-	// trae 调度：主排程（签到/token 预刷新）+ 9074 签到退避重试循环。
+	// trae 调度：主排程（签到/token 预刷新）+ 9074 签到退避重试循环
+	// + 积分明细定点刷新（启动即刷一轮，之后每 6h；与 DeductCredits 内存预扣
+	// 构成「调用扣减 → 权威校准」闭环，面板 24h/48h 到期列实时反映消耗）。
 	if traeSched != nil {
 		go traeSched.Run(ctx)
 		go traeSched.RetryLoop(ctx, 15*time.Minute)
+		go traeSched.CreditsLoop(ctx)
 	}
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	// 积分包明细每日拉取 + 启动预热：包快照持久化在 state.json（docker 重启不失忆），
+	// 启动时若池内无快照（首次部署/新账号）先拉一轮，之后每天 05:20 刷新一次；
+	// 消耗引发的余额变化由 NoteModelCost 在快照上实时扣减，不打上游。
+	go func() {
+		sch.RunPackageRefreshNow()
+		sch.StartPackageRefresh(ctx)
+	}()
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -503,7 +493,7 @@ func panelListenPath(listen string) string {
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
-//   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
+//   - listen / auth_dir / state_file / upstream.* / upstash.*（TTL 类）
 //
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
@@ -584,6 +574,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
+	p.SetAccountOrder(newCfg.Pool.AccountOrder) // 手工使用顺序热生效（面板账号池 ↑↓）
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
@@ -623,7 +614,6 @@ func restartRequiredFields(c *Config) []string {
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}
-	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
 	// trae 渠道的池/上游/调度器/回调监听都是装配期对象，暂不支持热替换；
@@ -632,7 +622,7 @@ func restartRequiredFields(c *Config) []string {
 		"trae.checkin_hour", "trae.refresh_hours", "trae.refresh_skew", "trae.max_rotate",
 		"trae.plan_cooldown", "trae.soft_cooldown", "trae.err_threshold", "trae.err_cooldown",
 		"trae.default_model", "trae.work_mode", "trae.work_bridge_url", "trae.work_bridge_token",
-		"trae.credit_reset_day")
+		"trae.credit_reset_day", "trae.user_agent")
 	return out
 }
 

@@ -211,6 +211,17 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
+		// 包快照：惰性过滤已过期/非法包（重启跨过失效时刻的包不复活）；空快照不建切片。
+		// FEFO 序由落盘侧保证（SetCreditPackages 升序写入、consumePkgsLocked 原序扣减），
+		// 恢复时按原序回放即可。
+		if len(s.Packages) > 0 {
+			for _, k := range s.Packages {
+				if k.Remain <= 0 || k.ExpireAt.IsZero() || !now.Before(k.ExpireAt) {
+					continue
+				}
+				e.pkgs = append(e.pkgs, k)
+			}
+		}
 		p.byUID[uid] = e
 	}
 }
@@ -337,6 +348,15 @@ func (p *Pool) stateOverviewLocked() stateFile {
 					s.ModelCosts = map[string]stateModelCost{}
 				}
 				s.ModelCosts[m] = stateModelCost{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+			}
+		}
+		// 包快照：惰性过滤已过期/非法包后落盘（keep FEFO 序）；空快照不写（omitempty）。
+		if len(e.pkgs) > 0 {
+			for _, k := range e.pkgs {
+				if k.Remain <= 0 || k.ExpireAt.IsZero() || !now.Before(k.ExpireAt) {
+					continue
+				}
+				s.Packages = append(s.Packages, k)
 			}
 		}
 		sf.Accounts[uid] = s

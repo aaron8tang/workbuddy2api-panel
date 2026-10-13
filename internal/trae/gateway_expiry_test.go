@@ -49,18 +49,18 @@ func TestEarliestCreditExpiryGating(t *testing.T) {
 
 	// 真实明细（SetCreditExpiry）优先于估算：取健康账号中最早未来到期时刻。
 	real := now.Add(3 * 24 * time.Hour).Truncate(time.Second).Unix()
-	tp.SetCreditExpiry("u1", real)
+	tp.SetCreditExpiry("u1", real, nil)
 	got, ok = g.EarliestCreditExpiry()
 	if !ok || got.Unix() != real {
 		t.Fatalf("real detail: got %v ok=%v, want %v", got, ok, time.Unix(real, 0))
 	}
 	// 真实明细已过期 → 回退估算。
-	tp.SetCreditExpiry("u1", now.Add(-time.Hour).Unix())
+	tp.SetCreditExpiry("u1", now.Add(-time.Hour).Unix(), nil)
 	got, ok = g.EarliestCreditExpiry()
 	if !ok || !got.Equal(nextMonthlyReset(now, 1)) {
 		t.Fatalf("expired detail fallback: got %v ok=%v, want next reset", got, ok)
 	}
-	tp.SetCreditExpiry("u1", 0)
+	tp.SetCreditExpiry("u1", 0, nil)
 
 	// 重置日关闭（0）且无明细 → 未知。
 	g0 := New(Config{Pool: tp, Upstream: nil, WorkMode: "disabled", CreditResetDay: 0})

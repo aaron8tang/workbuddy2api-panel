@@ -35,6 +35,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	if err := json.Unmarshal(src, &obj); err != nil {
 		return src
 	}
+	stripForbiddenTopFields(obj)
 	obj["stream"] = true
 	// max_completion_tokens → max_tokens 翻译（吸收上游 PR #116，Closes #117）：
 	// OpenAI 规范里 max_tokens 已 deprecated、max_completion_tokens 是新字段；
@@ -89,6 +90,24 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		return src
 	}
 	return out
+}
+
+// forbiddenTopFields body 顶层客户端私有字段拒绝清单：透传到 WorkBuddy 上游会被
+// 整体拒收（HTTP 400 "header destination-addr invalid: 127.0.0.1:7863, specifying
+// loopback address is NOT allowed"，错误码 4028）。TraeCN 客户端在 body 顶层携带
+// destination-addr（其本机代理地址），属客户端侧路由元数据，与上游语义无关；SOLO
+// 池（internal/trae/upstream）出站走白名单天然已剔，CN 池全量透传故需 denylist。
+// 上游再暴露对其他私有字段的拒收时在此追加（snake/kebab 双形态各列一条）。
+var forbiddenTopFields = []string{"destination-addr", "destination_addr"}
+
+// stripForbiddenTopFields 原地删除 body 顶层的拒绝清单字段；命中即打日志（排障指纹）。
+func stripForbiddenTopFields(obj map[string]any) {
+	for _, f := range forbiddenTopFields {
+		if _, ok := obj[f]; ok {
+			delete(obj, f)
+			log.Printf("[payload] stripped client-private field %q from body", f)
+		}
+	}
 }
 
 // translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游

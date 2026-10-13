@@ -3,7 +3,7 @@
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
-let overviewData = null, cfgLoaded = null;
+let overviewData = null, cfgLoaded = null, poolOrder = null, lastAccRender = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
@@ -369,12 +369,83 @@ setTimeout(() => {
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+// expWindowSumsByUID 从 lastPackages（积分构成/到期卡片共享缓存）提取每账号在
+// 指定小时窗口内到期的积分合计（未到期批次按到期日折算：批次到期日落在
+// [今天, 今天+winDays] 即计入——上游按天粒度扣包，窗口近似到天）。账号池表格的
+// 「24h/48h到期」列与 FEFO 展示排序共用；缓存不存在（本次会话没查过到期）时
+// count=0，展示保持后端原序——不自动触发上游查询（逐账号实时查很重，保持到期
+// 卡片的按需查询策略）。
+function expWindowSumsByUID(winHours) {
+  const byUID = {};
+  let count = 0;
+  if (lastPackages) {
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const winDays = Math.floor(winHours / 24); // 24h→1 天、48h→2 天（天粒度批次）
+    for (const a of lastPackages.accounts || []) {
+      if (a.error) continue;
+      const bs = expBatches(a.packages).filter(b => {
+        const d = expDaysLeft(b.date, today);
+        return d >= 0 && d <= winDays;
+      });
+      if (bs.length) { byUID[a.uid] = bs.reduce((s, b) => s + b.remain, 0); count++; }
+    }
+  }
+  return { byUID, count };
+}
+
+// earliestExpiryByUID 从 lastPackages 提取每账号最早未到期批次日期，FEFO 展示
+// 排序用（「24h/48h到期」两列只显示量，排序仍按最早到期先后——与上游扣包顺序同源）。
+function earliestExpiryByUID() {
+  const byUID = {};
+  let count = 0;
+  if (lastPackages) {
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    for (const a of lastPackages.accounts || []) {
+      if (a.error) continue;
+      const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
+      if (bs.length) { byUID[a.uid] = bs[0].date; count++; }
+    }
+  }
+  return { byUID, count };
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="11"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
+  // 展示顺序（与使用顺序同源）：① 手工使用顺序（poolOrder 非空，↑↓ 维护，选号
+  // 按此优先）② FEFO——最早到期批次升序（上游扣包按失效时刻先后，最先到期的
+  // 最该先用），需要到期缓存数据，无数据保持后端原序。未覆盖/无到期的账号垫底，
+  // 保持原相对序（稳定排序）。
+  list = list.slice();
+  const exp = earliestExpiryByUID();
+  const exp24 = expWindowSumsByUID(24);
+  const exp48 = expWindowSumsByUID(48);
+  // 到期数据源：后端 Status 透出的包快照派生值（s.exp_24h / s.exp_48h /
+  // s.earliest_expiry_day：每日拉取写入 + 每次消耗实时 FEFO 扣减 + 落盘防重启，
+  // 实时准确）优先；无快照（旧后端/快照未建）回退 lastPackages 缓存（到期卡片
+  // 显式检查后才有数据）。有快照时 exp_24h/exp_48h 因 omitempty 零值缺席按 0 计。
+  const hasPkgs = s => !!s.earliest_expiry_day;
+  const v24Of = s => (hasPkgs(s) ? (s.exp_24h || 0) : exp24.byUID[s.uid]);
+  const v48Of = s => (hasPkgs(s) ? (s.exp_48h || 0) : exp48.byUID[s.uid]);
+  const expKeyOf = s => (hasPkgs(s) ? s.earliest_expiry_day : exp.byUID[s.uid]);
+  const hasExpData = list.some(hasPkgs) || exp.count > 0;
+  if (poolOrder) {
+    const idx = new Map(poolOrder.map((u, i) => [u, i]));
+    const base = poolOrder.length;
+    list.sort((x, y) => (idx.has(x.uid) ? idx.get(x.uid) : base) - (idx.has(y.uid) ? idx.get(y.uid) : base));
+  } else if (hasExpData) {
+    list.sort((x, y) => {
+      const dx = expKeyOf(x), dy = expKeyOf(y);
+      if (dx === dy) return 0;
+      if (!dx) return 1;
+      if (!dy) return -1;
+      return dx < dy ? -1 : 1;
+    });
+  }
+  lastAccRender = list;
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
   tb.innerHTML = list.map(s => {
@@ -423,6 +494,18 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+    // 24h/48h 到期积分列：窗口内作废的积分量（天粒度近似）。数据源见上方
+    // v24Of/v48Of（后端包快照派生值优先，lastPackages 缓存回退）。「24h」列含
+    // 当天到期批次；FEFO 排序仍按最早到期先后（exp 列的 title 保留日期）。
+    const v24 = v24Of(s), v48 = v48Of(s);
+    const expDate = expKeyOf(s);
+    const noData = v24 == null && v48 == null && !expDate;
+    const winCell = (v, hours) => '<td class="num"' +
+      (v > 0 ? ' style="color:var(--warn);font-weight:600"' : ' style="color:var(--ink-3)"') +
+      ' title="' + (v > 0 ? hours + ' 小时内到期积分合计' : (noData ? '无到期数据（点「积分到期提醒」的检查后显示）' : hours + ' 小时内无到期积分')) + '">' +
+      (v > 0 ? fmtTok(v) : (noData ? '—' : '0')) + '</td>';
+    const expCell = '<td class="num" title="' + (expDate ? '最早未到期批次 ' + esc(expDate) + '（FEFO 排序依据，上游按失效先后优先扣减）' : '无到期数据') + '"' +
+      (expDate ? '' : ' style="color:var(--ink-3)"') + '>' + (expDate ? esc(expDate.slice(5)) : '—') + '</td>';
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
@@ -436,8 +519,12 @@ function renderAccounts(list) {
         '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
-      '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
+      winCell(v24, 24) +
+      winCell(v48, 48) +
+      expCell +
       '<td class="acts">' +
+        '<button class="xs ghost" data-a="moveup" data-u="' + esc(s.uid) + '" title="上移：更早被使用（顺序即使用优先级）">↑</button>' +
+        '<button class="xs ghost" data-a="movedn" data-u="' + esc(s.uid) + '" title="下移：更晚被使用">↓</button>' +
         // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
         // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
         // upstream 的 get-enterprise-user-usage 口径填充。
@@ -504,14 +591,17 @@ async function loadOverview(quiet) {
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
-    $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
     const p = $('navPulse');
     p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
-    $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
+    // poolOrder 先取值再渲染：展示排序/提示/按钮都依赖本次最新的手工顺序。
+    poolOrder = (d.account_order && d.account_order.length) ? d.account_order : null;
+    $('accNote').textContent = (d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' + (poolOrder ? ' · ' : '') : '') +
+      (poolOrder ? '手工使用顺序生效中（选号按面板顺序优先）' : '');
+    if ($('btnAutoOrder')) $('btnAutoOrder').hidden = !poolOrder;
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
@@ -533,6 +623,18 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
+    } else if (a === 'moveup' || a === 'movedn') {
+      // 手工使用顺序：↑↓ 即时保存（config pool.account_order 持久化 + 选号热生效）。
+      // 基线语义：首次点击时以「当前展示顺序」为起点微调（FEFO 已排好的样子就是
+      // 用户看到的样子），而不是从后端原始顺序开始跳变。
+      if (!poolOrder) poolOrder = (lastAccRender || []).map(s => s.uid);
+      const i = poolOrder.indexOf(u), j = i + (a === 'moveup' ? -1 : 1);
+      if (i < 0 || j < 0 || j >= poolOrder.length) return;
+      const tmp = poolOrder[i]; poolOrder[i] = poolOrder[j]; poolOrder[j] = tmp;
+      await api('config', { method: 'POST', body: JSON.stringify({ pool: { account_order: poolOrder } }) });
+      toast('使用顺序已保存：选号按面板顺序优先（排前者先用）', 'ok');
+      // 顺序刷新交给本层 finally 的 loadOverview(true)（重拉 overview → 按 poolOrder 重排）。
+      return;
     } else if (a === 'revive') {
       await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
       toast('已解冻', 'ok');
@@ -570,6 +672,22 @@ $('btnTravelAll').onclick = async () => {
 $('btnActivityAll').onclick = async () => {
   try { await api('activity_all', { method: 'POST' }); toast('活跃上报已开始，结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
+};
+
+// 恢复自动排序：清空手工使用顺序（config pool.account_order 置空 + 选号回加权随机），
+// 展示回到 FEFO（最早到期升序，有到期缓存时）。
+if ($('btnAutoOrder')) $('btnAutoOrder').onclick = async () => {
+  try {
+    await api('config', { method: 'POST', body: JSON.stringify({ pool: { account_order: [] } }) });
+    poolOrder = null;
+    toast('已恢复自动模式：展示按最早到期排序，选号回加权随机 + 快过期硬优先', 'ok');
+    // FEFO 展示依赖到期批次数据（lastPackages）：本次会话没查过到期时缓存为空，
+    // 表格会保持后端原序——按钮承诺的「按最早到期排序」不兑现，观感即「排序反了/
+    // 没反应」（原序第一恰好可能是到期最远的号）。缓存缺失/过期时主动查一次
+    // （与到期卡片「检查」同源同重），等数据回来再重拉 overview 让 FEFO 生效。
+    if (!lastPackages || Date.now() - lastPackagesAt > EXP_FRESH_MS) await loadExpiry(true);
+    loadOverview(true);
+  } catch (e) { toast(e.message, 'err'); }
 };
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
@@ -1131,12 +1249,11 @@ const CFG_MAP = {
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
-  ttl: ['session_sticky', 'ttl'],
   timeout_seconds: ['upstream', 'timeout_seconds'], header_timeout_seconds: ['upstream', 'header_timeout_seconds'],
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
+  trae_user_agent: ['trae', 'user_agent'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
-  session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
@@ -1150,7 +1267,7 @@ const CFG_MAP = {
  * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
  * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
  */
-const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+const CLEARABLE_CFG = new Set(['user_agent', 'trae_user_agent', 'prompt_file']);
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -1348,6 +1465,8 @@ $('importFile').onchange = async () => {
 
 /* ── TRAE 渠道 ────────────────────────────────────────────────────── */
 let traeLoginPending = null, traeLoginTimer = null;
+// trae 手工使用顺序（status.account_order；↑↓ 维护，选号按面板顺序优先）。
+let traeOrder = null, lastTraeRender = null;
 
 // 渠道关闭（Trae 未装配）时 /panel/api/trae/* 整组端点不注册 → 404，
 // 前端据此切到「未启用」提示，主面板视图零回归。
@@ -1359,7 +1478,11 @@ async function loadTrae(quiet) {
   try {
     const st = await api('trae/status');
     traeSetDisabledUI(false);
-    $('traeNote').textContent = st.servable ? '渠道可服务' : '当前无可服务账号';
+    // 手工顺序先取再渲染：展示排序/提示/↑↓ 基线都依赖本次最新顺序。
+    traeOrder = (st.account_order && st.account_order.length) ? st.account_order : null;
+    if ($('btnTraeAutoOrder')) $('btnTraeAutoOrder').hidden = !traeOrder;
+    $('traeNote').textContent = (st.servable ? '渠道可服务' : '当前无可服务账号') +
+      (traeOrder ? ' · 手工使用顺序生效中' : '');
     renderTraeAccounts(st.accounts || []);
   } catch (e) {
     if (String(e.message).includes('404')) { traeSetDisabledUI(true); return; }
@@ -1369,9 +1492,28 @@ async function loadTrae(quiet) {
 function renderTraeAccounts(list) {
   const tb = $('traeBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty"><div class="big">TRAE 账号是空的</div>点击右上角「Web 登录」添加一个 TRAE 账号，或粘贴回调链接导入凭证</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">TRAE 账号是空的</div>点击右上角「Web 登录」添加一个 TRAE 账号，或粘贴回调链接导入凭证</div></td></tr>';
     return;
   }
+  // 展示顺序（与使用顺序同源）：① 手工使用顺序生效时按 traeOrder 重排，未覆盖的
+  // 账号垫底（与主池 renderAccounts 同语义，稳定排序）；② 自动模式按最早积分到期
+  // 升序（FEFO：最早到期的最该先用；credit_expires_at=0 表示未刷新过明细，垫底
+  // 保持原相对序）。
+  list = list.slice();
+  if (traeOrder) {
+    const idx = new Map(traeOrder.map((u, i) => [u, i]));
+    const base = traeOrder.length;
+    list.sort((x, y) => (idx.has(x.uid) ? idx.get(x.uid) : base) - (idx.has(y.uid) ? idx.get(y.uid) : base));
+  } else if (list.some(s => s.credit_expires_at > 0)) {
+    list.sort((x, y) => {
+      const dx = x.credit_expires_at || 0, dy = y.credit_expires_at || 0;
+      if (!dx && !dy) return 0;
+      if (!dx) return 1;
+      if (!dy) return -1;
+      return dx - dy;
+    });
+  }
+  lastTraeRender = list;
   tb.innerHTML = list.map(s => {
     let cls = '', tag;
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
@@ -1394,6 +1536,14 @@ function renderTraeAccounts(list) {
       cexp = new Date(s.credit_expires_at * 1000).toLocaleString();
       if (s.credit_expires_at * 1000 - Date.now() < 7 * 86400e3) cexp += ' <span class="tag warn">即将过期</span>';
     }
+    // 24h/48h 到期列：后端按 credit_packs 天粒度窗口聚合（exp_24h/exp_48h）。
+    // credit_packs 缺失 = 从未刷新过明细（显示 —，点「刷新」/「查积分」拉取）；
+    // 有明细则 0 也如实显示，>0 打 warn 色。
+    const noPacks = !s.credit_packs || !s.credit_packs.length;
+    const winCell = (v, hours) => '<td class="num"' +
+      (v > 0 ? ' style="color:var(--warn);font-weight:600"' : ' style="color:var(--ink-3)"') +
+      ' title="' + (noPacks ? '无到期数据（点「刷新」或「查积分」后显示）' : (v > 0 ? hours + ' 小时内到期积分合计' : hours + ' 小时内无到期积分')) + '">' +
+      (noPacks ? '—' : fmtTok(v || 0)) + '</td>';
     const toggle = s.enabled
       ? '<button class="xs" data-a="trae-off" data-u="' + esc(s.uid) + '">停用</button>'
       : '<button class="xs" data-a="trae-on" data-u="' + esc(s.uid) + '">启用</button>';
@@ -1402,20 +1552,54 @@ function renderTraeAccounts(list) {
       '<td>' + name + '<div class="hint" style="font-size:11.5px;color:var(--ink-3)">' + esc(uidShort) + err + '</div>' + note + '</td>' +
       '<td>' + tag + '</td>' +
       '<td>' + s.credits + '</td>' +
+      winCell(s.exp_24h || 0, 24) +
+      winCell(s.exp_48h || 0, 48) +
       '<td>' + cexp + '</td>' +
       '<td>' + exp + '</td>' +
-      '<td class="c-acts">' + toggle +
+      '<td class="c-acts">' +
+      '<button class="xs ghost" data-a="trae-moveup" data-u="' + esc(s.uid) + '" title="上移：更早被使用（顺序即使用优先级）">↑</button>' +
+      '<button class="xs ghost" data-a="trae-movedn" data-u="' + esc(s.uid) + '" title="下移：更晚被使用">↓</button>' +
+      toggle +
       '<button class="xs" data-a="trae-refresh" data-u="' + esc(s.uid) + '">刷新</button>' +
       '<button class="xs" data-a="trae-credits" data-u="' + esc(s.uid) + '">查积分</button>' +
       '<button class="xs ghost" data-a="trae-del" data-u="' + esc(s.uid) + '">移除</button></td>' +
       '</tr>';
   }).join('');
 }
+// 恢复自动排序：清空 trae 手工使用顺序（POST accounts/order 空数组 = 清空 + 选号
+// 回积分权重），展示回到 FEFO（最早积分到期升序）。
+if ($('btnTraeAutoOrder')) $('btnTraeAutoOrder').onclick = async () => {
+  try {
+    await api('trae/accounts/order', { method: 'POST', body: JSON.stringify({ order: [] }) });
+    traeOrder = null;
+    toast('已恢复自动模式：展示按最早积分到期排序，选号回积分权重', 'ok');
+    loadTrae(true);
+  } catch (e) { toast(e.message, 'err'); }
+};
+
 $('traeBody').onclick = async ev => {
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
   const uid = b.dataset.u, act = b.dataset.a;
   const enc = encodeURIComponent(uid);
+  if (act === 'trae-moveup' || act === 'trae-movedn') {
+    // trae 手工使用顺序：↑↓ 即时保存（POST accounts/order 持久化 + 选号热生效）。
+    // 基线语义与主池一致：首次点击以「当前展示顺序」为起点微调。
+    if (!traeOrder) traeOrder = (lastTraeRender || []).map(s => s.uid);
+    const i = traeOrder.indexOf(uid), j = i + (act === 'trae-moveup' ? -1 : 1);
+    if (i < 0 || j < 0 || j >= traeOrder.length) return;
+    const tmp = traeOrder[i]; traeOrder[i] = traeOrder[j]; traeOrder[j] = tmp;
+    b.disabled = true;
+    try {
+      await api('trae/accounts/order', { method: 'POST', body: JSON.stringify({ order: traeOrder }) });
+      toast('使用顺序已保存：选号按面板顺序优先（排前者先用）', 'ok');
+    } catch (e) {
+      toast('保存顺序失败：' + e.message, 'err');
+    } finally {
+      loadTrae(true);
+    }
+    return;
+  }
   if (act === 'trae-on' || act === 'trae-off') {
     b.disabled = true;
     try {
@@ -3132,6 +3316,11 @@ function expDaysLeft(dateStr, today) {
 function renderExpiry(d) {
   const list = (d.accounts || []);
   const today = new Date(); today.setHours(0, 0, 0, 0);
+  // 统计窗口跟随后端下发的快过期路由窗口（pool.expiring_soon，如 24h），与选号
+  // 「快过期硬优先」同源——不再写死 7 天。缺字段（旧后端/测试桩）回落 168h 旧行为。
+  const winHours = Number(d.expiring_window_hours) > 0 ? Number(d.expiring_window_hours) : 168;
+  const winDays = winHours / 24; // 到期日按天粒度，窗口折算成天（可为小数）
+  const winLabel = winHours % 24 === 0 ? (winHours / 24) + ' 天' : winHours + ' 小时';
   // 按「最近到期」升序排（issue #125）。
   //
   // 后端 /panel/api/packages 是按**余额降序**返回的，恰好把 CN 账号都排在前面、
@@ -3139,7 +3328,7 @@ function renderExpiry(d) {
   // "最快过期的排最前"这个唯一重要的顺序成立，且不分域。
   //
   // 排序键用最早到期批次的日期（expBatches 已按日期升序，故 [0] 即最早）。
-  // 查询失败的账号、以及 7 天内无到期的账号没有可比较的到期时间，统一排在最后，
+  // 查询失败的账号、以及没有未到期批次的账号没有可比较的到期时间，统一排在最后，
   // 保持它们原本的相对顺序（稳定排序）。
   const keyed = list.map(a => {
     let key = null;
@@ -3165,17 +3354,18 @@ function renderExpiry(d) {
     if (!bs.length) {
       return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
         '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
-        '<span class="exp-main">7 天内无到期积分</span></div>';
+        '<span class="exp-main">' + esc(winLabel) + '内无到期积分</span></div>';
     }
     const first = bs[0];
     const days = expDaysLeft(first.date, today);
     const daily = Math.ceil(first.remain / Math.max(1, days));
-    const week = bs.filter(b => expDaysLeft(b.date, today) <= 7)
+    const week = bs.filter(b => expDaysLeft(b.date, today) <= winDays)
       .reduce((s, b) => s + b.remain, 0);
-    // 危险度：≤3 天红（不抓紧就真没了）、≤7 天琥珀、更远绿。
+    // 危险度：≤3 天红（不抓紧就真没了）、路由窗口内琥珀（正是会被优先消耗的层）、
+    // 更远绿。窗口 <3 天时琥珀层被红覆盖属正常（窗口内的号更紧急）。
     // 上游扣包是 FEFO（按失效时刻升序，实测两号口径一致）：这些快过期批次正是
     // 被消耗得最快的，日均需耗给的是「哪怕单靠这个账号的自然流量也能对齐」的参照。
-    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
+    const cls = days <= 3 ? 'var(--bad)' : days <= winDays ? 'var(--warn)' : 'var(--ok)';
     const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
     const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
     const rest = bs.slice(1, 4).map(b =>
@@ -3185,7 +3375,7 @@ function renderExpiry(d) {
       '<span class="exp-main">最近到期 <b>' + esc(first.date) + '</b>（' + dayWord +
       '）· 该批 <b>' + fmtTok(first.remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
       fmtTok(daily) + '</b>' +
-      (week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : '') +
+      (week > first.remain ? ' · ' + esc(winLabel) + '内合计 ' + fmtTok(week) : '') +
       (rest ? '<div class="note">' + rest + '</div>' : '') +
       '</span></div>';
   }).join('');

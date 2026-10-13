@@ -1740,33 +1740,122 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 	}
 }
 
-func TestPickPrefersExpiringByVirtualWeight(t *testing.T) {
+// TestPickExpiringHardTier 快过期硬优先：存在有效快过期候选时，普通账号中签率
+// 必须为 0（×3 软加权时代普通号每个新会话仍有 ~10% 概率被抽中——14:07 素素实案：
+// 31 天后才有积分到期的号被选中并粘性锁 30 分钟）；关闭 prefer_expiring 恢复旧
+// 软加权语义，普通账号重新参与抽签。
+func TestPickExpiringHardTier(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
-	p.Add(&auth.Auth{UID: "later"})
 	p.Add(&auth.Auth{UID: "soon"})
+	p.Add(&auth.Auth{UID: "later"})
 	p.Add(&auth.Auth{UID: "none"})
 
 	now := time.Now()
-	p.SetCreditsDetailed("later", 100, 100, 100, now.Add(48*time.Hour), 100)
 	p.SetCreditsDetailed("soon", 100, 100, 100, now.Add(2*time.Hour), 100)
+	p.SetCreditsDetailed("later", 100, 100, 100, now.Add(47*time.Hour), 100)
 	p.SetCreditsDetailed("none", 100, 100, 0, time.Time{}, 0)
 
-	// 3:1 虚拟实例是软偏好而非硬优先。用确定性随机源统计长期分布：两个快过期
-	// 账号的合计份额应显著高于普通账号，同时普通账号仍保留少量流量。
 	rng := rand.New(rand.NewPCG(1, 2))
 	p.SetRandomSource(func(n int64) int64 { return rng.Int64N(n) })
 	counts := map[string]int{}
-	for i := 0; i < 2000; i++ {
+	for i := 0; i < 500; i++ {
 		got := p.Pick()
 		if got == nil {
 			t.Fatal("pick returned nil")
 		}
 		counts[got.UID]++
 	}
-	expiring := counts["soon"] + counts["later"]
-	if expiring < 1500 || counts["none"] == 0 {
-		t.Fatalf("virtual weight distribution=%v, want expiring majority and regular non-zero", counts)
+	if counts["none"] != 0 || counts["soon"] == 0 || counts["later"] == 0 {
+		t.Fatalf("hard tier distribution=%v, want only expiring accounts picked", counts)
+	}
+
+	// 关闭开关：恢复旧语义，普通账号重新可见。
+	p.SetPreferExpiring(false)
+	seenNone := false
+	for i := 0; i < 500; i++ {
+		if got := p.Pick(); got != nil && got.UID == "none" {
+			seenNone = true
+			break
+		}
+	}
+	if !seenNone {
+		t.Fatal("prefer_expiring=false should restore non-expiring accounts into the draw")
+	}
+}
+
+// TestPickExpiringHardTierFallback 快过期号全部不可用（禁用）时回退全集：选号
+// 不因硬过滤失去候选（硬过滤只作用于健康候选集，健康过滤在前已把不可用号剔除）。
+func TestPickExpiringHardTierFallback(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "soon"})
+	p.Add(&auth.Auth{UID: "none"})
+	now := time.Now()
+	p.SetCreditsDetailed("soon", 100, 100, 100, now.Add(2*time.Hour), 100)
+	p.SetCreditsDetailed("none", 100, 100, 0, time.Time{}, 0)
+	p.Disable("soon", "test disable")
+
+	rng := rand.New(rand.NewPCG(3, 4))
+	p.SetRandomSource(func(n int64) int64 { return rng.Int64N(n) })
+	for i := 0; i < 50; i++ {
+		got := p.Pick()
+		if got == nil {
+			t.Fatal("pick returned nil (fallback broken)")
+		}
+		if got.UID != "none" {
+			t.Fatalf("disabled expiring account picked: %s", got.UID)
+		}
+	}
+}
+
+// TestPickAccountOrder 手工使用顺序（pool.account_order，面板账号池 ↑↓ 维护）：
+// 配置后 pick() 在最终候选内按顺序取第一个可用者——顺序即使用优先级，压过积分
+// 权重与快过期硬优先（用户手工排序就是要 override 自动策略）。未覆盖的账号垫底，
+// order 内全部不可用时回落垫底号，清空顺序恢复加权随机。
+func TestPickAccountOrder(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetRandomSource(func(n int64) int64 { return 0 }) // 全程确定性：r=0 恒命中权重最高者
+	for _, u := range []string{"high", "mid", "low", "outsider"} {
+		p.Add(&auth.Auth{UID: u})
+	}
+	// high 积分碾压（自动模式下必被多数选中）；mid/low 积分低。
+	p.SetCredits("high", 50000, 0)
+	p.SetCredits("mid", 100, 0)
+	p.SetCredits("low", 50, 0)
+	p.SetCredits("outsider", 100, 0)
+
+	// 顺序 low → mid：low 压过 high 的积分权重，连续 pick 恒命中 low。
+	p.SetAccountOrder([]string{"low", "mid"})
+	for i := 0; i < 20; i++ {
+		if got := p.Pick(); got == nil || got.UID != "low" {
+			t.Fatalf("iter %d: pick=%v, want low (order rank beats credits)", i, got)
+		}
+	}
+
+	// order 内第一名被禁用 → 顺延第二名 mid（顺序语义：不可用自然轮到下一个）。
+	p.Disable("low", "test")
+	if got := p.Pick(); got == nil || got.UID != "mid" {
+		t.Fatalf("pick=%v, want mid (second in order after first disabled)", got)
+	}
+
+	// order 内全部不可用 → 回落垫底号（outsider/high 未入 order，垫底层按权重选
+	// high 必中）。SetAccountOrder 后新加的账号天然垫底。
+	p.Disable("mid", "test")
+	if got := p.Pick(); got == nil || got.UID != "high" {
+		t.Fatalf("pick=%v, want high (fallback to unranked when all ranked disabled)", got)
+	}
+
+	// 清空顺序 → 回自动加权随机，high 的积分权重重新生效。
+	p.SetAccountOrder(nil)
+	if got := p.Pick(); got == nil || got.UID != "high" {
+		t.Fatalf("pick=%v, want high (weighted mode restored after clearing order)", got)
+	}
+	// AccountOrder() getter 与设置值一致；nil 时透出空。
+	p.SetAccountOrder([]string{"mid", "low", "mid"}) // 重复项去重
+	if got := p.AccountOrder(); len(got) != 2 || got[0] != "mid" || got[1] != "low" {
+		t.Fatalf("AccountOrder()=%v, want [mid low] (deduped)", got)
 	}
 }
 

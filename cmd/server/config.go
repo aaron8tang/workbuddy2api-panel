@@ -135,9 +135,9 @@ type Config struct {
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
 		UserAgent string `json:"user_agent"`
 		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
-		// X-IDE-Version）。空 = 内置默认（对齐官方 5.5.4 分发包）。
+		// X-IDE-Version）。空 = 内置默认（对齐官方 5.8.0 分发包）。
 		ClientVersion string `json:"client_version"`
-		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.161.0）。
 		CliVersion string `json:"cli_version"`
 		// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
 		// 空 = 旧行为 X-Product="SaaS" 不设 X-IDE-*；配 "WorkBuddy" 则四头跟随。
@@ -207,13 +207,12 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// AccountOrder 手工使用顺序（面板账号池 ↑↓ 维护的 uid 有序列表）：配置后
+		// pick() 在最终候选（健康/成本层/快过期层过滤后）内按此顺序取第一个可用者
+		// ——顺序即使用优先级，覆盖加权随机；顺序未覆盖的账号垫底。空 = 自动模式
+		// （加权随机 + 快过期硬优先）。
+		AccountOrder []string `json:"account_order,omitempty"`
 	} `json:"pool"`
-
-	SessionSticky struct {
-		Enabled    bool   `json:"enabled"`     // 默认 true
-		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
-		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
-	} `json:"session_sticky"`
 
 	// ModelGroups 模型组（面板「模型与档位 → 模型组」可在线编辑，热生效）：
 	// 按组暴露独立 OpenAI 兼容路由 /{组名}/v1/chat/completions 与 /{组名}/v1/models
@@ -264,6 +263,10 @@ type Config struct {
 		// 数据，模型组跨渠道「谁先到期用谁」排序按该日估算到期时刻；0 = 关闭估算
 		//（trae 渠道到期信号视为未知，default 排序退化为倍率序）。
 		CreditResetDay int `json:"credit_reset_day"`
+		// UserAgent trae 渠道 SOLO 对话/模型请求（llm_utils_chat / get_detail_param）
+		// 出站 User-Agent 覆盖。空 = 内置默认 "hertz"（WorkBuddy 客户端调 trae 后端
+		// 的特征 UA）。签到/积分/token 刷新仍用内置 Trae/<IdeVersion>。
+		UserAgent string `json:"user_agent"`
 	} `json:"trae"`
 
 	// 解析后
@@ -273,8 +276,6 @@ type Config struct {
 	BreakerCooldownMaxD    time.Duration `json:"-"`
 	DegradeCooldownDur     time.Duration `json:"-"`
 	DegradeCooldownMaxD    time.Duration `json:"-"`
-	SessionTTL             time.Duration `json:"-"`
-	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
@@ -349,9 +350,6 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
-	c.SessionSticky.Enabled = true
-	c.SessionSticky.TTL = "30m"
-	c.SessionSticky.GCInterval = "5m"
 	// Trae 渠道缺省值：开关默认开（无账号即天然不服务）；端口/排程/冷却对齐 trae2api 默认。
 	c.Trae.Enabled = true
 	c.Trae.StateFile = "./data/trae_state.json"
@@ -568,12 +566,6 @@ func (c *Config) normalize() error {
 	}
 	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil {
 		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
-	}
-	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
-		return fmt.Errorf("session_sticky.ttl: %w", err)
-	}
-	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
-		return fmt.Errorf("session_sticky.gc_interval: %w", err)
 	}
 	// 快过期窗口：空 = 禁用（ExpiringSoonDur 0）；非空必须可解析（拼写错误 fail fast）。
 	if c.Pool.ExpiringSoon != "" {

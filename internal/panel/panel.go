@@ -62,9 +62,6 @@ type Config struct {
 	// ApplyConfig 闭包完成热生效（池参数/排程/密钥/脱敏）。error 时配置不写盘。
 	SaveConfig func(raw []byte) (restartRequired []string, err error)
 
-	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
-	StickyCount func() int
-
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
@@ -245,23 +242,21 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 用 WithPaused 而不是 CountsDetailed：后者把暂停号并进 disabled（/status 的
 	// 「不可用」口径），而概况卡片要分开展示（issue #125）。
 	total, healthy, cooling, disabled, paused, inFlightFull := p.cfg.Pool.CountsDetailedWithPaused()
-	sticky := 0
-	if p.cfg.StickyCount != nil {
-		sticky = p.cfg.StickyCount()
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":         p.cfg.Version,
-		"uptime_sec":      int(time.Since(p.started).Seconds()),
-		"auth_required":   p.apiKey() != "",
-		"redis_mode":      p.cfg.RedisMode,
-		"sticky_sessions": sticky,
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"paused":          paused,
-		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		"version":        p.cfg.Version,
+		"uptime_sec":     int(time.Since(p.started).Seconds()),
+		"auth_required":  p.apiKey() != "",
+		"redis_mode":     p.cfg.RedisMode,
+		"total":          total,
+		"healthy":        healthy,
+		"cooling":        cooling,
+		"disabled":       disabled,
+		"paused":         paused,
+		"in_flight_full": inFlightFull,
+		"accounts":       p.cfg.Pool.List(),
+		// account_order 手工使用顺序（面板账号池 ↑↓ 维护）：非空时账号池按它显示、
+		// 选号按它优先；null = 自动模式（FEFO 展示 + 加权随机选号）。
+		"account_order": p.cfg.Pool.AccountOrder(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
@@ -860,7 +855,14 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 
 	// 余额降序：多的在前，便于和少的对比。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+	resp := map[string]any{"accounts": out}
+	// 快过期路由窗口随数据下发：首页「积分到期提醒」的统计口径（N 天内合计/无到期）
+	// 必须与路由的 expiring_soon 同源，而不是前端写死的 7 天。0 = 无调度器（测试面板），
+	// 前端回落旧行为。
+	if win := p.expiringSoonWindow(); win > 0 {
+		resp["expiring_window_hours"] = int(win.Hours() + 0.5) // 四舍五入到整小时
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

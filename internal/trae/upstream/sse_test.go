@@ -2,6 +2,8 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -71,6 +73,31 @@ func TestPrepareBodyInvalidJSON(t *testing.T) {
 	out := PrepareBody(in)
 	if string(out) != string(in) {
 		t.Error("invalid json should pass through unchanged")
+	}
+}
+
+// TestPrepareBodyStripsUnknownFields 白名单之外的顶层字段（agent CLI 私有字段，
+// 如 destination-addr 类代理地址）必须剔除，不得透传给 SOLO 上游。
+func TestPrepareBodyStripsUnknownFields(t *testing.T) {
+	src := `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],
+	  "user":"agent-uid-123","metadata":{"trace":"x"},
+	  "destination_addr":"127.0.0.1:7863","stream_options":{},
+	  "temperature":0.7}`
+	out := PrepareBody([]byte(src))
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, banned := range []string{"user", "metadata", "destination_addr", "stream_options"} {
+		if _, has := obj[banned]; has {
+			t.Errorf("field %q must be stripped, got %v", banned, obj[banned])
+		}
+	}
+	if obj["temperature"] != 0.7 {
+		t.Errorf("temperature should be kept, got %v", obj["temperature"])
+	}
+	if _, has := obj["messages"]; !has {
+		t.Error("messages must be kept")
 	}
 }
 
@@ -314,5 +341,98 @@ func TestPrepareBodyToolCallWithoutNameDropped(t *testing.T) {
 	assistant := msgs[1].(map[string]any)
 	if _, has := assistant["tool_calls"]; has {
 		t.Error("tool_call without name should be dropped")
+	}
+}
+
+// TestStreamEmptyUpstreamBodyYieldsErrorEvent 上游 200 + 非 SSE 体（TRAE 惯用
+// 200+JSON 业务错误码应答）曾被静默吞掉：客户端只收到 [DONE]（零内容零
+// finish_reason）、agent 端显示「用户已取消」、服务端记 200 成功。现在必须
+// 显式写 error 事件并返回哨兵错误，供调用方计账号错误与采样诊断。
+func TestStreamEmptyUpstreamBodyYieldsErrorEvent(t *testing.T) {
+	for name, body := range map[string]string{
+		"json business error": `{"code":1005,"message":"plan limit"}`,
+		"empty body":          "",
+	} {
+		rec := httptest.NewRecorder()
+		err := Stream(rec, strings.NewReader(body))
+		if !errors.Is(err, ErrEmptyStream) {
+			t.Fatalf("%s: want ErrEmptyStream, got %v", name, err)
+		}
+		got := rec.Body.String()
+		if !strings.Contains(got, "event: error") || !strings.Contains(got, ErrEmptyStream.Error()) {
+			t.Fatalf("%s: output should carry error event, got %q", name, got)
+		}
+		if !strings.Contains(got, "data: [DONE]") {
+			t.Fatalf("%s: output should still end with [DONE], got %q", name, got)
+		}
+	}
+}
+
+// TestAggregateEmptyUpstreamBody 非流式聚合对空流同样返回哨兵错误（调用方据此
+// 记账号错误并轮转，而非把空 completion 当成功透出）。
+func TestAggregateEmptyUpstreamBody(t *testing.T) {
+	if _, err := Aggregate(strings.NewReader(`{"error":"upstream exploded"}`)); !errors.Is(err, ErrEmptyStream) {
+		t.Fatalf("want ErrEmptyStream, got %v", err)
+	}
+}
+
+// TestStreamWithErrorEarlyErrorReturnsBeforeWrite 早错（error 事件先于任何 output
+// 出现）时不向客户端写任何字节——响应头未提交，调用方可冷却账号并轮转下一账号
+// 重试。此前错误被直接注入 SSE：客户端没收到任何 OpenAI 格式内容，WorkBuddy
+// CLI 只能显示「用户已取消」。
+func TestStreamWithErrorEarlyErrorReturnsBeforeWrite(t *testing.T) {
+	sse := "event:error\ndata:{\"code\":3004,\"message\":\"rate limit\"}\n\n"
+	var gotErr *SOLOStreamError
+	rec := httptest.NewRecorder()
+	err := StreamWithError(rec, strings.NewReader(sse), func(se *SOLOStreamError) { gotErr = se })
+	if gotErr == nil || gotErr.Code != 3004 {
+		t.Fatalf("onErr callback should fire with code=3004, got %+v", gotErr)
+	}
+	var se *SOLOStreamError
+	if !errors.As(err, &se) || se.Code != 3004 {
+		t.Fatalf("want *SOLOStreamError code=3004, got %v", err)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("early error must not write SSE (headers uncommitted → caller can rotate), got %q", rec.Body.String())
+	}
+}
+
+// TestStreamWithErrorMidStreamErrorStillInjects 中途错误（已写过内容 chunk）仍
+// 透传：error 事件 + [DONE] 注入 SSE，客户端能看到已生成内容与错误提示。
+func TestStreamWithErrorMidStreamErrorStillInjects(t *testing.T) {
+	sse := "event:output\ndata:{\"response\":\"hello\"}\n\n" +
+		"event:error\ndata:{\"code\":1005,\"message\":\"plan limit\"}\n\n"
+	rec := httptest.NewRecorder()
+	err := StreamWithError(rec, strings.NewReader(sse), nil)
+	if err != nil {
+		t.Fatalf("mid-stream error is injected into SSE, not returned; got %v", err)
+	}
+	got := rec.Body.String()
+	if !strings.Contains(got, `"content":"hello"`) {
+		t.Fatalf("mid-stream error should keep prior content, got %q", got)
+	}
+	if !strings.Contains(got, "event: error") || !strings.Contains(got, "data: [DONE]") {
+		t.Fatalf("mid-stream error should inject error event + [DONE], got %q", got)
+	}
+}
+
+// TestSOLOStreamErrorKind3004 3004（上游限流文案）归类为 ErrSoftRate，
+// 驱动短冷却而非长冷却。
+func TestSOLOStreamErrorKind3004(t *testing.T) {
+	if k := (&SOLOStreamError{Code: 3004}).Kind(); k != ErrSoftRate {
+		t.Fatalf("3004 should classify as ErrSoftRate, got %v", k)
+	}
+}
+
+// TestHeadCaptureSamplesHead HeadCapture 只采样前 max 字节，数据与 EOF 原样透传。
+func TestHeadCaptureSamplesHead(t *testing.T) {
+	src := strings.Repeat("x", 3000)
+	hc := NewHeadCapture(strings.NewReader(src), 2048)
+	all, err := io.ReadAll(hc)
+	if err != nil || len(all) != 3000 {
+		t.Fatalf("passthrough broken: n=%d err=%v", len(all), err)
+	}
+	if hc.Head() != src[:2048] {
+		t.Fatalf("head len=%d want 2048 (content mismatch)", len(hc.Head()))
 	}
 }

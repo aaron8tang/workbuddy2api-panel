@@ -13,18 +13,33 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
 )
 
+// clientUA ug/oauth 域（签到/积分/token 刷新）的内置 UA。
 const clientUA = "Trae/" + IdeVersion
+
+// defaultSoloUA SOLO 对话/模型请求（llm_utils_chat / get_detail_param）的默认出站
+// User-Agent："hertz"（WorkBuddy 客户端调 trae 后端的特征 UA，字节系 Go HTTP 框架）。
+// config trae.user_agent 可覆盖。
+const defaultSoloUA = "hertz"
+
+// soloUA 返回 SOLO 路径出站 UA：Client.UserAgent（config trae.user_agent）非空
+// 优先，空回落 defaultSoloUA。ug/oauth 域不在此列（保持 clientUA）。
+func (c *Client) soloUA() string {
+	if c != nil && c.UserAgent != "" {
+		return c.UserAgent
+	}
+	return defaultSoloUA
+}
 
 // SOLOHeaders 设置 llm_utils_chat / get_detail_param 所需的 SOLO 专属头。
 // 规则来自 SPEC §1 SOLO headers（实测必须）。
-func SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
+func (c *Client) SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	req.Header.Set("Content-Type", "application/json")
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("User-Agent", c.soloUA())
 	at := a.JWT() // 读锁快照，防与 RefreshToken 写并发竞态
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+at)
 	req.Header.Set("X-Cloudide-Token", at)

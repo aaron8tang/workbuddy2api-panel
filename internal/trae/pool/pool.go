@@ -5,6 +5,8 @@ package pool
 
 import (
 	"encoding/json"
+	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -64,6 +66,15 @@ type Status struct {
 	// 中 status=1 且有剩余积分的包里最早的 expire_time。0 = 未知（尚未刷新过明细）。
 	// 供模型组跨渠道「谁先到期用谁」排序使用；签到/积分刷新时更新。
 	EarliestCreditExpiry int64 `json:"earliest_credit_expiry,omitempty"`
+	// CreditPacks 权益包到期明细（面板「24h/48h 到期」列数据源）：每包
+	// 到期时刻（Unix 秒）+ 剩余积分。随积分刷新更新并持久化；空 = 未刷新过。
+	CreditPacks []CreditPack `json:"credit_packs,omitempty"`
+}
+
+// CreditPack 单个权益包的到期明细快照（面板窗口到期量统计用）。
+type CreditPack struct {
+	ExpireAt int64   `json:"expire_at"`          // Unix 秒；0 = 无限期（不参与到期统计）
+	Remain   float64 `json:"remain"`             // 剩余积分（limit - used）
 }
 
 type entry struct {
@@ -92,7 +103,10 @@ type entry struct {
 	lastSuccess  time.Time
 	lastErr      time.Time
 
-	creditExpiry int64 // 最早积分到期时刻（Unix 秒，0=未知）；随积分刷新更新并持久化
+	creditExpiry int64         // 最早积分到期时刻（Unix 秒，0=未知）；随积分刷新更新并持久化
+	creditPacks  []CreditPack  // 权益包到期明细快照（面板 24h/48h 到期列）
+	orderRank    int           // 手工使用顺序名次（1 起，0 = 未排序垫底）
+	rateTokens   float64       // 上次权威同步以来累计的 rate 加权 tokens（Σ rate×tokens），校准样本量
 }
 
 func (e *entry) healthy(now time.Time) bool {
@@ -115,6 +129,32 @@ func (e *entry) healthyWork(now time.Time) bool {
 	return true
 }
 
+// expiring24h 统计 24h 窗口内到期作废的积分合计与最早到期时刻（Unix 秒）。
+// 口径与 gateway.Accounts() 的 Exp24h 列完全一致（自然日天粒度：到期日=今天或
+// 明天，d∈{0,1}），避免面板展示与选号行为出现两套标准。无明细快照或窗口内
+// 无到期返回 (0, 0)。选号临期硬偏好的判定数据源。
+func (e *entry) expiring24h(now time.Time) (float64, int64) {
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	var sum float64
+	var earliest int64
+	for _, pk := range e.creditPacks {
+		if pk.ExpireAt <= 0 || pk.Remain <= 0 {
+			continue
+		}
+		exp := time.Unix(pk.ExpireAt, 0)
+		expDay := time.Date(exp.Year(), exp.Month(), exp.Day(), 0, 0, 0, 0, now.Location())
+		d := int(expDay.Sub(today).Hours() / 24)
+		if d < 0 || d > 1 {
+			continue
+		}
+		sum += pk.Remain
+		if earliest == 0 || pk.ExpireAt < earliest {
+			earliest = pk.ExpireAt
+		}
+	}
+	return sum, earliest
+}
+
 // stateEntry state.json 单账号持久化条目。
 type stateEntry struct {
 	Credits           int64     `json:"credits"`
@@ -131,11 +171,19 @@ type stateEntry struct {
 	// CreditExpiry 最早积分到期时刻（Unix 秒，0=未知）。来自权益包 expire_time 明细，
 	// 重启不丢（跨渠道到期排序依赖它，避免每次重启都等下一次积分刷新）。
 	CreditExpiry int64 `json:"credit_expiry,omitempty"`
+	// CreditPacks 权益包到期明细快照（面板 24h/48h 到期列数据源），重启不丢。
+	CreditPacks []CreditPack `json:"credit_packs,omitempty"`
+	// AccountOrder 每账号在 trae 池手工使用顺序中的名次（1 起，0 = 未排序）。
+	// 挂在每个账号上持久化，比全局数组对 state.json 的 map 结构更自然。
+	AccountOrder int `json:"account_order,omitempty"`
 }
 
 // stateFile 持久化格式。
 type stateFile struct {
 	Accounts map[string]stateEntry `json:"accounts"`
+	// CalibCreditPerMTok 池级积分换算系数（每百万 tokens × 倍率=1 消耗的积分），
+	// 由权威余量差 EMA 校准；0 = 未持久化（回落默认值）。
+	CalibCreditPerMTok float64 `json:"calib_credit_per_mtok,omitempty"`
 }
 
 // Pool 账号池。
@@ -143,14 +191,11 @@ type Pool struct {
 	mu          sync.RWMutex
 	byUID       map[string]*entry
 	stateFp     string
-	affinity    map[string]affinityEntry
-	affinityTTL time.Duration
 	maxInFlight int
-}
-
-type affinityEntry struct {
-	uid      string
-	lastSeen time.Time
+	// calib 积分换算系数：每百万 tokens × 倍率=1 消耗的积分数。上游未公开
+	// tokens→积分公式，初始取实测量级起点，随后由 SetCreditExpiry 的权威余量差
+	// EMA 自动校准（见 calibrateLocked）；持久化于 state.json 池级字段。
+	calib float64
 }
 
 // New 构建池；stateFp 非空时尝试加载旧状态。
@@ -158,9 +203,8 @@ func New(stateFp string) *Pool {
 	p := &Pool{
 		byUID:       map[string]*entry{},
 		stateFp:     stateFp,
-		affinity:    map[string]affinityEntry{},
-		affinityTTL: 30 * time.Minute,
 		maxInFlight: 3,
+		calib:       creditCalibDefault,
 	}
 	if stateFp != "" {
 		p.load()
@@ -291,33 +335,9 @@ func (p *Pool) SetEnabled(uid string, enabled bool, reason string) bool {
 	return true
 }
 
-// Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
+// Pick 返回 healthy 中的择优账号；无可用返回 nil。
 func (p *Pool) Pick() *auth.Auth {
 	return p.PickExcluding(nil)
-}
-
-// PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
-// 优化：当积分相同时按 UID 升序稳定排序，避免 Go map 随机遍历导致在相同积分账号间跳跃。
-func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	var best *entry
-	for uid, e := range p.byUID {
-		if tried != nil && tried[uid] {
-			continue
-		}
-		if !e.healthy(now) {
-			continue
-		}
-		if best == nil || e.credits > best.credits || (e.credits == best.credits && uid < best.a.UID) {
-			best = e
-		}
-	}
-	if best == nil {
-		return nil
-	}
-	return best.a
 }
 
 const minPickGap = 100 * time.Millisecond
@@ -350,6 +370,13 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 }
 
 // pickBestCandidateLocked 综合健康检查、在途租约、三因子权重与防惊群窗口选号。
+// 手工使用顺序生效时（存在 orderRank>0 的账号），名次成为主序：rank 升序、
+// 未排序账号垫底，且候选名单截 1——顺序第一名不可用（冷却/在途满/不健康）时
+// 根本进不了候选，自然轮到下一名；此时临期硬偏好整体让位（手工顺序压过临期，
+// 与主池粘性分配路径 realm.go 同约定：用户手工拖到第一位的远期号必须可被选中）。
+// 自动模式下候选中存在 24h 窗口内到期积分的账号时，收敛候选集到这些账号（硬偏好，
+// 「先用掉要过期的积分」，积分最高但远期到期的账号中签率为 0），排序次键为
+// FEFO（最早到期时刻升序，谁先到期先用谁）。无临期账号时与既有三因子行为完全一致。
 func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *entry {
 	var cands []*entry
 	for uid, e := range p.byUID {
@@ -379,29 +406,84 @@ func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *en
 		return nil
 	}
 
-	var maxCredits int64
+	type cand struct {
+		e    *entry
+		fefe int64 // 24h 窗口内最早到期时刻（Unix 秒，0=无临期积分）
+	}
+	cs := make([]cand, 0, len(cands))
+	nExpiring := 0
+	manualOrder := false
 	for _, e := range cands {
-		if e.credits > maxCredits {
-			maxCredits = e.credits
+		if e.orderRank > 0 {
+			manualOrder = true
+		}
+		_, earliest := e.expiring24h(now)
+		if earliest > 0 {
+			nExpiring++
+		}
+		cs = append(cs, cand{e: e, fefe: earliest})
+	}
+	// 临期硬偏好只在自动模式生效：手工使用顺序压过它——若硬过滤先剔除远期号，
+	// 用户手工拖到第一位的远期号将永远轮不到。幸存集为真子集时才收敛；全员临期
+	// 或全员无临期时候选集不变（前者 FEFO 次键仍决定先后，后者零回归）。
+	if !manualOrder && nExpiring > 0 && nExpiring < len(cs) {
+		log.Printf("[trae_pool] expiring hard tier kept=%d/%d candidates", nExpiring, len(cs))
+		kept := make([]cand, 0, nExpiring)
+		for _, c := range cs {
+			if c.fefe > 0 {
+				kept = append(kept, c)
+			}
+		}
+		cs = kept
+	}
+
+	var maxCredits int64
+	for _, c := range cs {
+		if c.e.credits > maxCredits {
+			maxCredits = c.e.credits
 		}
 	}
 
 	type weighted struct {
-		e *entry
-		w float64
+		e    *entry
+		w    float64
+		rank int
+		fefe int64
 	}
-	ws := make([]weighted, len(cands))
-	for i, e := range cands {
-		ws[i] = weighted{e: e, w: p.weightOf(e, maxCredits, now)}
+	ws := make([]weighted, len(cs))
+	for i, c := range cs {
+		ws[i] = weighted{e: c.e, w: p.weightOf(c.e, maxCredits, now), rank: c.e.orderRank, fefe: c.fefe}
 	}
 	sort.Slice(ws, func(i, j int) bool {
+		// 手工顺序主序：双方均有名次时 rank 升序；仅一方有名次则其在前。
+		ri, rj := ws[i].rank, ws[j].rank
+		if ri > 0 && rj > 0 && ri != rj {
+			return ri < rj
+		}
+		if ri > 0 && rj == 0 {
+			return true
+		}
+		if ri == 0 && rj > 0 {
+			return false
+		}
+		// 临期 FEFO 次键：谁先到期先用谁。无临期积分的账号 fefe=0 垫底；全员
+		// 无临期时该分支恒假，退化为三因子权重（零回归）。
+		if ws[i].fefe != ws[j].fefe {
+			return ws[i].fefe < ws[j].fefe
+		}
 		if ws[i].w != ws[j].w {
 			return ws[i].w > ws[j].w
 		}
 		return ws[i].e.a.UID < ws[j].e.a.UID
 	})
 	top := make([]*entry, 0, 5)
-	for i := 0; i < len(ws) && i < 5; i++ {
+	topN := 5
+	// 手工顺序模式截 1：minPickGap 防撞号与 LRU 兜底机制照常生效，
+	// 100ms 窗口外的每个请求严格命中顺序第一名。
+	if ws[0].rank > 0 {
+		topN = 1
+	}
+	for i := 0; i < len(ws) && i < topN; i++ {
 		top = append(top, ws[i].e)
 	}
 
@@ -426,49 +508,17 @@ func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *en
 	return selected
 }
 
-// PickAffinity 优先按 sessionKey 会话粘性返回健康账号；未命中或已冷却则降级择优并绑定，
-// 保持同一会话持续使用同一账号，最大化大模型服务端 Prompt/KV Cache 命中率。
-func (p *Pool) PickAffinity(sessionKey string, tried map[string]bool) *auth.Auth {
+// PickExcluding 返回健康且未被排除的账号，走三因子加权与防惊群短名单调度
+//（手工顺序主序 + 临期 FEFO 次键 + 权重）。会话粘性已整体移除：prompt_cache_key
+// 统一后同会话跨账号/跨池 cache key 恒定，粘性不再有缓存收益，反而把请求钉死在
+// 临期账号上（chenwei 实案）——每次调用即时择优，积分最临期者先用。
+func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now := time.Now()
-
-	// 1. 若提供了 sessionKey，优先复用健康的已有绑定账号（且未占满在途并发）
-	if sessionKey != "" {
-		if aff, ok := p.affinity[sessionKey]; ok {
-			if tried == nil || !tried[aff.uid] {
-				if e, exists := p.byUID[aff.uid]; exists && e.healthy(now) && !p.inFlightFull(e) {
-					aff.lastSeen = now
-					p.affinity[sessionKey] = aff
-					e.lastUsed = now
-					return e.a
-				}
-			}
-		}
-	}
-
-	// 2. 无粘性绑定或原账号已不可用/已满载，走三因子加权与防惊群短名单调度
-	best := p.pickBestCandidateLocked(tried, now)
+	best := p.pickBestCandidateLocked(tried, time.Now())
 	if best == nil {
 		return nil
 	}
-
-	// 3. 记录新的会话粘性绑定
-	if sessionKey != "" {
-		p.affinity[sessionKey] = affinityEntry{
-			uid:      best.a.UID,
-			lastSeen: now,
-		}
-		// 惰性清理过期会话
-		if len(p.affinity) > 500 {
-			for k, v := range p.affinity {
-				if now.Sub(v.lastSeen) > p.affinityTTL {
-					delete(p.affinity, k)
-				}
-			}
-		}
-	}
-
 	return best.a
 }
 
@@ -480,11 +530,13 @@ func (p *Pool) PickWork() *auth.Auth {
 // PickWorkExcluding 返回 healthyWork 中未被排除的账号。
 // 调度策略：优先选择可用 work_credits 最多的账号；
 // 若所有账号 work_credits 均为 0（如尚未探测），仍选择首个健康账号以供探测与请求。
+// 手工使用顺序生效时名次压过 work_credits 权重（与主通道语义一致）。
 func (p *Pool) PickWorkExcluding(tried map[string]bool) *auth.Auth {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	var best *entry
+	bestRank := 0
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
@@ -492,58 +544,30 @@ func (p *Pool) PickWorkExcluding(tried map[string]bool) *auth.Auth {
 		if !e.healthyWork(now) {
 			continue
 		}
-		if best == nil || e.workCredits > best.workCredits || (e.workCredits == best.workCredits && uid < best.a.UID) {
-			best = e
+		r := e.orderRank
+		if best == nil {
+			best, bestRank = e, r
+			continue
+		}
+		swap := false
+		switch {
+		case r > 0 && bestRank == 0:
+			swap = true
+		case r > 0 && bestRank > 0:
+			swap = r < bestRank
+		case r == 0 && bestRank == 0:
+			swap = e.workCredits > best.workCredits || (e.workCredits == best.workCredits && uid < best.a.UID)
+		default:
+			// 未排序账号不得挤掉已排序账号（与 PickExcluding 同修复，防 map 遍历抖动）
+			swap = false
+		}
+		if swap {
+			best, bestRank = e, r
 		}
 	}
 	if best == nil {
 		return nil
 	}
-	return best.a
-}
-
-// PickWorkAffinity 针对 Work 通道实现会话粘性调度。
-func (p *Pool) PickWorkAffinity(sessionKey string, tried map[string]bool) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	now := time.Now()
-
-	if sessionKey != "" {
-		workKey := "work:" + sessionKey
-		if aff, ok := p.affinity[workKey]; ok {
-			if tried == nil || !tried[aff.uid] {
-				if e, exists := p.byUID[aff.uid]; exists && e.healthyWork(now) {
-					aff.lastSeen = now
-					p.affinity[workKey] = aff
-					return e.a
-				}
-			}
-		}
-	}
-
-	var best *entry
-	for uid, e := range p.byUID {
-		if tried != nil && tried[uid] {
-			continue
-		}
-		if !e.healthyWork(now) {
-			continue
-		}
-		if best == nil || e.workCredits > best.workCredits || (e.workCredits == best.workCredits && uid < best.a.UID) {
-			best = e
-		}
-	}
-	if best == nil {
-		return nil
-	}
-
-	if sessionKey != "" {
-		p.affinity["work:"+sessionKey] = affinityEntry{
-			uid:      best.a.UID,
-			lastSeen: now,
-		}
-	}
-
 	return best.a
 }
 
@@ -618,18 +642,241 @@ func (p *Pool) SetCredits(uid string, credits int64) {
 	p.saveLocked()
 }
 
-// SetCreditExpiry 更新账号的最早积分到期时刻（Unix 秒；0 = 清除/未知）。
+// SetCreditExpiry 更新账号的最早积分到期时刻与权益包到期明细快照（at=0 清除）。
 // 数据源：ide_user_ent_usage 权益包 expire_time 明细（scheduler 积分刷新时写入），
-// 供模型组跨渠道「谁先到期用谁」排序。
-func (p *Pool) SetCreditExpiry(uid string, at int64) {
+// 供模型组跨渠道「谁先到期用谁」排序与面板「24h/48h 到期」列。
+// 覆盖前先做估算校准（calibrateLocked）：本次为上游权威余量，与扣减后的内存
+// 余量之差即真实消费，用于修正 DeductCredits 的换算系数。
+func (p *Pool) SetCreditExpiry(uid string, at int64, packs []CreditPack) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.creditExpiry = at
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	changed := p.calibrateLocked(e, packs)
+	e.creditExpiry = at
+	e.creditPacks = packs
+	if changed {
+		p.saveLocked()
+	}
+}
+
+// creditCalibDefault 积分换算系数起点：每百万 tokens × 倍率=1 消耗的积分数。
+// 上游未公开公式，取实测量级起点（签到包 150 积分/日 ≈ glm-5.3 0.78× 数百万
+// tokens）；持久化后由权威余量差 EMA 收敛到真实值，起点误差只影响首个刷新周期。
+const creditCalibDefault = 100.0
+
+// DeductCredits 调用成功后按「倍率 × tokens」在内存中预扣积分：权益包明细按
+// FEFO（最早到期优先）扣减、聚合余额同步下降——面板 24h/48h 到期列与 pick()
+// 加权轮换下一次调用即反映真实消耗，无需等下一次积分刷新。
+// rate 为模型计费倍率（Gateway.RateOf），0 = 未知倍率：直接跳过本次预扣与样本
+// 累计（换算瞎猜会污染面板数字；该调用消耗会体现在下次权威校准的余量差中，
+// 系数偏差由 EMA 收敛）。totalTokens 取上游 usage.total_tokens。
+func (p *Pool) DeductCredits(uid string, rate float64, totalTokens int64) {
+	if totalTokens <= 0 || rate <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || p.calib <= 0 {
+		return
+	}
+	cost := p.calib * rate * float64(totalTokens) / 1e6
+	if cost <= 0 {
+		return
+	}
+	e.rateTokens += rate * float64(totalTokens)
+	deductFEFO(e.creditPacks, cost)
+	if e.credits > 0 {
+		if c := math.Round(float64(e.credits) - cost); c > 0 {
+			e.credits = int64(c)
+		} else {
+			e.credits = 0
+		}
+	}
+	// 观测日志：flash 类低倍率模型单次消耗远小于 1 积分（int64 余额无感），链路
+	// 是否活着只能靠此行确认；cost 累计误差由下次权威刷新的 EMA 校准收敛。
+	log.Printf("[trae_pool] deduct %s: rate=%.2f tokens=%d cost=%.4f credits=%d", uid, rate, totalTokens, cost, e.credits)
+	p.saveLocked()
+}
+
+// deductFEFO 从权益包明细按最早到期优先扣减 cost 积分（ExpireAt=0 视为最远期）。
+// 余量扣到 0 为止；明细为空或 cost 超出总余量时尽力扣（聚合余额已同步下降，
+// 差额由下次权威刷新校平）。
+func deductFEFO(packs []CreditPack, cost float64) {
+	if len(packs) == 0 || cost <= 0 {
+		return
+	}
+	idx := make([]int, len(packs))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		ea, eb := packs[idx[a]].ExpireAt, packs[idx[b]].ExpireAt
+		if ea == 0 {
+			ea = math.MaxInt64
+		}
+		if eb == 0 {
+			eb = math.MaxInt64
+		}
+		return ea < eb
+	})
+	for _, i := range idx {
+		if cost <= 0 {
+			break
+		}
+		pk := &packs[i]
+		if pk.Remain <= 0 {
+			continue
+		}
+		take := pk.Remain
+		if take > cost {
+			take = cost
+		}
+		pk.Remain -= take
+		cost -= take
+	}
+}
+
+// calibClampLo / calibClampHi 换算系数的有界区间：防离群观测把系数推到荒谬值
+// （obs→0 时扣减失效，obs→∞ 时一笔扣穿）。正常量级在 1~1000 之间。
+const (
+	calibClampLo = 1e-3
+	calibClampHi = 1e5
+)
+
+// calibMinSample 校准最小样本量（rate 加权 tokens）：低于此值视为单请求噪声，
+// 不构成样本（如仅一次 5 万 tokens 的 flash 调用，扣减量级太小读不准）。
+const calibMinSample = 1e5
+
+// calibrateLocked 权威余量差校准：obs = (扣减后内存余量 − 上游权威余量) /
+// (rate 加权百万 tokens)，即每「百万 tokens × 倍率=1」的真实积分消耗。EMA 0.5
+// 平滑写入池级系数；返回是否发生系数变更（调用方据此决定落盘）。
+// 样本窗口以两次权威同步为界：无论是否成样，rateTokens 均清零（样本必须先读后清）。
+// 跳过校准的情形：样本不足（rateTokens < calibMinSample）、期间有权益包到期
+// 清退（余量差混入到期作废，非纯消费）、无消费或赠送回补（delta<=0）、观测异常。
+func (p *Pool) calibrateLocked(e *entry, packs []CreditPack) bool {
+	sample := e.rateTokens // 先读：两次权威同步间累计的 Σ rate×tokens
+	e.rateTokens = 0       // 后清：本次权威同步即重置样本窗口
+	if len(e.creditPacks) == 0 || len(packs) == 0 {
+		return false
+	}
+	now := time.Now().Unix()
+	for _, pk := range e.creditPacks {
+		if pk.Remain > 0 && pk.ExpireAt > 0 && pk.ExpireAt <= now {
+			return false // 有包在两次同步间到期清退，余量差不纯是消费
+		}
+	}
+	prev, next := 0.0, 0.0
+	for _, pk := range e.creditPacks {
+		prev += pk.Remain
+	}
+	for _, pk := range packs {
+		next += pk.Remain
+	}
+	delta := prev - next
+	if delta <= 0 {
+		return false // 无消费（或签到赠送/回补），不构成样本
+	}
+	if sample < calibMinSample {
+		return false // 样本不足，防单请求噪声
+	}
+	obs := delta / (sample / 1e6)
+	if math.IsNaN(obs) || math.IsInf(obs, 0) || obs <= 0 || obs > calibClampHi {
+		log.Printf("[trae_pool] credit calib skipped: obs=%.4f out of range (delta=%.2f, sample=%.0f)", obs, delta, sample)
+		return false
+	}
+	old := p.calib
+	p.calib = 0.5*old + 0.5*obs
+	if p.calib < calibClampLo {
+		p.calib = calibClampLo
+	} else if p.calib > calibClampHi {
+		p.calib = calibClampHi
+	}
+	log.Printf("[trae_pool] credit calib: obs=%.4f calib %.4f→%.4f (delta=%.2f credits, sample=%.0f rateTokens)",
+		obs, old, p.calib, delta, sample)
+	return true
+}
+
+// CreditCalib 返回当前换算系数（观测/诊断用）。
+func (p *Pool) CreditCalib() float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.calib
+}
+
+// SetAccountOrder 设置手工使用顺序（uid 有序列表；空 = 清空恢复自动模式）。
+// 顺序模式 pickBestCandidateLocked 按 rank 优先选号（显式 override，压过积分权重），
+// 未覆盖的账号垫底（rank=0）。每账号名次挂在其 state 条目上持久化。
+func (p *Pool) SetAccountOrder(order []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	seen := map[string]bool{}
+	rank := 0
+	for _, uid := range order {
+		if uid == "" || seen[uid] {
+			continue
+		}
+		seen[uid] = true
+		rank++
+		if e, ok := p.byUID[uid]; ok {
+			e.orderRank = rank
+		}
+	}
+	for uid, e := range p.byUID {
+		if !seen[uid] {
+			e.orderRank = 0 // 未覆盖/清空 → 回落自动模式
+		}
 	}
 	p.saveLocked()
 }
 
+// AccountOrder 返回当前手工顺序（按 rank 升序的 uid 列表；未启用返回空）。
+func (p *Pool) AccountOrder() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	type pair struct {
+		uid  string
+		rank int
+	}
+	var ps []pair
+	for uid, e := range p.byUID {
+		if e.orderRank > 0 {
+			ps = append(ps, pair{uid, e.orderRank})
+		}
+	}
+	if len(ps) == 0 {
+		return nil
+	}
+	sort.Slice(ps, func(i, j int) bool { return ps[i].rank < ps[j].rank })
+	out := make([]string, len(ps))
+	for i, v := range ps {
+		out[i] = v.uid
+	}
+	return out
+}
+
+// AccountOrderActive 手工使用顺序模式是否生效。
+func (p *Pool) AccountOrderActive() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, e := range p.byUID {
+		if e.orderRank > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// orderRankOf 返回 uid 的手工顺序名次（0 = 未排序）。
+func (p *Pool) orderRankOf(uid string) int {
+	if e, ok := p.byUID[uid]; ok {
+		return e.orderRank
+	}
+	return 0
+}
 // Cooldown 冷却账号至 now+d。
 func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason string) {
 	p.mu.Lock()
@@ -850,6 +1097,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		LastErr:      e.lastErr,
 
 		EarliestCreditExpiry: e.creditExpiry,
+		CreditPacks:          e.creditPacks,
 	}
 }
 
@@ -865,6 +1113,9 @@ func (p *Pool) load() {
 	var sf stateFile
 	if json.Unmarshal(raw, &sf) != nil {
 		return
+	}
+	if sf.CalibCreditPerMTok > 0 && sf.CalibCreditPerMTok >= calibClampLo && sf.CalibCreditPerMTok <= calibClampHi {
+		p.calib = sf.CalibCreditPerMTok // 池级系数持久化：重启不丢校准结果
 	}
 	for uid, s := range sf.Accounts {
 		enabled := true // 旧文件无 enabled 字段 → 默认启用，向后兼容
@@ -893,6 +1144,8 @@ func (p *Pool) load() {
 			checkinRetryAfter: s.CheckinRetryAfter,
 			checkinRetryCount: s.CheckinRetryCount,
 			creditExpiry:      s.CreditExpiry,
+			creditPacks:       s.CreditPacks,
+			orderRank:         s.AccountOrder,
 		}
 	}
 }
@@ -901,7 +1154,10 @@ func (p *Pool) saveLocked() {
 	if p.stateFp == "" {
 		return
 	}
-	sf := stateFile{Accounts: map[string]stateEntry{}}
+	sf := stateFile{
+		Accounts:           map[string]stateEntry{},
+		CalibCreditPerMTok: p.calib,
+	}
 	for uid, e := range p.byUID {
 		se := stateEntry{
 			Credits:           e.credits,
@@ -914,6 +1170,8 @@ func (p *Pool) saveLocked() {
 			CheckinRetryAfter: e.checkinRetryAfter,
 			CheckinRetryCount: e.checkinRetryCount,
 			CreditExpiry:      e.creditExpiry,
+			CreditPacks:       e.creditPacks,
+			AccountOrder:      e.orderRank,
 		}
 		if e.workCredits > 0 {
 			wc := e.workCredits

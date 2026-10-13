@@ -2,12 +2,14 @@ package upstream
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/promptcache"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
 )
 
@@ -54,6 +56,40 @@ func testClient(fn rtFunc) *Client {
 		UgHost:    "https://ug.example",
 		OAuthHost: "https://oauth.example",
 		ClientID:  ClientID,
+	}
+}
+
+// TestFetchModelsParsesConsumptionRate display_contact_config 内嵌 JSON 的
+// consumption_rate.rate 解析（TraeCN 桌面端「模型倍率」列同源）：
+// enable=false / 字段缺失 / 内嵌串为空 → Rate=0（调用方按未知倍率处理）。
+func TestFetchModelsParsesConsumptionRate(t *testing.T) {
+	body := `{"config_info_list":[
+		{"config_name":"glm-5.3-flash","display_config":{"display_name":"GLM Flash"},
+		 "display_contact_config":"{\"consumption_rate\":{\"enable\":true,\"data\":{\"rate\":0.06}}}"},
+		{"config_name":"glm-5.3","display_config":{"display_name":"GLM"},
+		 "display_contact_config":"{\"consumption_rate\":{\"enable\":true,\"data\":{\"rate\":0.78}}}"},
+		{"config_name":"kimi-k3","display_config":{"display_name":"Kimi"},
+		 "display_contact_config":"{\"consumption_rate\":{\"enable\":false,\"data\":{\"rate\":1.83}}}"},
+		{"config_name":"nocontact","display_config":{"display_name":"N"}}
+	]}`
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != EpModels {
+			t.Errorf("path=%s want %s", r.URL.Path, EpModels)
+		}
+		return jsonResp(200, body), nil
+	})
+	infos, err := c.FetchModels(&auth.Auth{UID: "u1"})
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	want := map[string]float64{"glm-5.3-flash": 0.06, "glm-5.3": 0.78, "kimi-k3": 0, "nocontact": 0}
+	if len(infos) != len(want) {
+		t.Fatalf("infos=%d want %d: %+v", len(infos), len(want), infos)
+	}
+	for _, mi := range infos {
+		if mi.Rate != want[mi.ID] {
+			t.Errorf("%s rate=%v want %v", mi.ID, mi.Rate, want[mi.ID])
+		}
 	}
 }
 
@@ -170,7 +206,7 @@ func TestChatStreamSendsHeadersAndRewritesBody(t *testing.T) {
 		}, nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1", MachineID: "m1", DeviceID: "d1"}
-	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "conv-1")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -187,6 +223,18 @@ func TestChatStreamSendsHeadersAndRewritesBody(t *testing.T) {
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) || !bytes.Contains(gotBody, []byte(`"function":"solo_work_lite"`)) {
 		t.Errorf("body not rewritten: %s", gotBody)
 	}
+	// P0：prompt_cache_key 注入（promptcache 共享实现，key 去账号化——
+	// 同会话跨账号/跨池恒定）。
+	var out struct {
+		CacheKey string `json:"prompt_cache_key"`
+	}
+	if err := json.Unmarshal(gotBody, &out); err != nil {
+		t.Fatalf("parse body: %v", err)
+	}
+	wantKey := promptcache.BuildCacheKey("conv-1")
+	if out.CacheKey != wantKey {
+		t.Errorf("prompt_cache_key=%q want %q", out.CacheKey, wantKey)
+	}
 }
 
 func TestChatStreamUsesDedicatedStreamClient(t *testing.T) {
@@ -199,7 +247,7 @@ func TestChatStreamUsesDedicatedStreamClient(t *testing.T) {
 		}, nil
 	})
 	c.StreamHTTP = &http.Client{Transport: c.HTTP.Transport} // 无 Timeout
-	rc, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{"model":"glm-5.2","messages":[]}`))
+	rc, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{"model":"glm-5.2","messages":[]}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -214,7 +262,7 @@ func TestChatStreamHTTPError(t *testing.T) {
 		return jsonResp(429, `rate limited`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	_, status, respBody, err := c.ChatStream(a, []byte(`{}`))
+	_, status, respBody, err := c.ChatStream(a, []byte(`{}`), "")
 	if status != 429 {
 		t.Errorf("status=%d", status)
 	}
@@ -398,5 +446,36 @@ func TestCheckinStatusSendsDerivedDeviceID(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("X-Device-Id=%q want derived %q", got, want)
+	}
+}
+
+// TestFetchModelsSoloUserAgent 覆盖 SOLO 路径出站 UA 的默认/覆盖两态：
+// Client.UserAgent（config trae.user_agent）非空优先，空回落内置 "hertz"
+//（WorkBuddy 客户端调 trae 后端的特征 UA）。
+func TestFetchModelsSoloUserAgent(t *testing.T) {
+	models := `{"config_info_list":[{"config_name":"glm-5.2","display_config":{"display_name":"GLM-5.2"},"model_detail_list":[{"model_name":"glm-5.2"}]}]}`
+	cases := []struct {
+		name string
+		ua   string
+		want string
+	}{
+		{"default hertz", "", "hertz"},
+		{"override", "MyAgent/1.2", "MyAgent/1.2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got string
+			c := testClient(func(r *http.Request) (*http.Response, error) {
+				got = r.Header.Get("User-Agent")
+				return jsonResp(200, models), nil
+			})
+			c.UserAgent = tc.ua
+			if _, err := c.FetchModels(&auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("User-Agent=%q want %q", got, tc.want)
+			}
+		})
 	}
 }

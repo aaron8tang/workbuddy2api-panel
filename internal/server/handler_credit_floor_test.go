@@ -99,7 +99,7 @@ func TestCreditFloorAllowsFreeRequest(t *testing.T) {
 	}
 	// pool 层与 handler 层口径一致（避免 handler 绕过 pool 的 floor 判定）。
 	if p.PickByUIDForModel("poor", "free-model") == nil {
-		t.Error("粘性路径对免费模型不应被 floor 拦")
+		t.Error("组钉直取路径对免费模型不应被 floor 拦")
 	}
 }
 

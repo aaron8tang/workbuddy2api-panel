@@ -163,23 +163,23 @@ func TestCreditFloorBoundaryAtFloor(t *testing.T) {
 	}
 }
 
-// TestCreditFloorStickyPathBlocked 粘性路径同样被 floor 约束：
-// 触底号即便被会话粘住，对收费模型也不得继续出票（PickByUIDForModel 返回 nil，
-// handler 侧解绑换号）。
-func TestCreditFloorStickyPathBlocked(t *testing.T) {
+// TestCreditFloorPinnedPathBlocked 组钉直取路径同样被 floor 约束：
+// 触底号即便被模型组钉定，对收费模型也不得继续出票（PickByUIDForModel 返回 nil，
+// handler 侧跳过该号换号）。
+func TestCreditFloorPinnedPathBlocked(t *testing.T) {
 	p := New("")
 	p.SetCreditFloor(100)
-	p.Add(&auth.Auth{UID: "sticky"})
-	p.SetCredits("sticky", 30, 0)
-	p.NoteModelCost("sticky", "hy4-preview", 2.9, 1000)
+	p.Add(&auth.Auth{UID: "pinned"})
+	p.SetCredits("pinned", 30, 0)
+	p.NoteModelCost("pinned", "hy4-preview", 2.9, 1000)
 
-	if a := p.PickByUIDForModel("sticky", "hy4-preview"); a != nil {
-		t.Fatalf("粘性号触底 + 收费模型应被 floor 拦（want nil），got %v", a.UID)
+	if a := p.PickByUIDForModel("pinned", "hy4-preview"); a != nil {
+		t.Fatalf("组钉号触底 + 收费模型应被 floor 拦（want nil），got %v", a.UID)
 	}
-	// 免费模型不受影响：同一粘性号照常出票。
-	p.NoteModelCost("sticky", "free-model", 0, 1000)
-	if a := p.PickByUIDForModel("sticky", "free-model"); a == nil {
-		t.Fatal("粘性号触底 + 免费模型应照常出票，got nil")
+	// 免费模型不受影响：同一组钉号照常出票。
+	p.NoteModelCost("pinned", "free-model", 0, 1000)
+	if a := p.PickByUIDForModel("pinned", "free-model"); a == nil {
+		t.Fatal("组钉号触底 + 免费模型应照常出票，got nil")
 	}
 }
 
@@ -360,9 +360,9 @@ func TestCreditFloorFallbackAllowsFreeModel(t *testing.T) {
 	}
 }
 
-// TestCreditFloorStickyBlockedByCatalogRate 粘性路径同判据：粘性号触底 + 目录判
-// 收费 → PickByUIDForModel 返回 nil，handler 解绑换号（避免钉在打穿的号上）。
-func TestCreditFloorStickyBlockedByCatalogRate(t *testing.T) {
+// TestCreditFloorPinnedBlockedByCatalogRate 组钉直取路径同判据：组钉号触底 + 目录判
+// 收费 → PickByUIDForModel 返回 nil，handler 跳过换号（避免钉在打穿的号上）。
+func TestCreditFloorPinnedBlockedByCatalogRate(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
 	p.SetCostExploreInterval(0)
@@ -377,11 +377,11 @@ func TestCreditFloorStickyBlockedByCatalogRate(t *testing.T) {
 	p.SetCredits("poor", 30, 0)
 
 	if a := p.PickByUIDForModel("poor", "kimi-k3-1"); a != nil {
-		t.Fatalf("粘性号触底且目录判收费应返回 nil（解绑换号），got %v", a)
+		t.Fatalf("组钉号触底且目录判收费应返回 nil（跳过换号），got %v", a)
 	}
 	// 回血后恢复：越过 floor 即放行。
 	p.SetCredits("poor", 500, 0)
 	if a := p.PickByUIDForModel("poor", "kimi-k3-1"); a == nil {
-		t.Fatal("回血越过 floor 后粘性号应恢复可选，got nil")
+		t.Fatal("回血越过 floor 后组钉号应恢复可选，got nil")
 	}
 }
