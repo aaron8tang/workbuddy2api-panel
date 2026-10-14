@@ -632,25 +632,18 @@ func (h *Handler) groupLookup(name string) (modelgroup.Group, bool) {
 	return h.cfg.ModelGroups.Lookup(name)
 }
 
-// groupModelPriority 返回组内模型的**生效优先级**顺序。最高键（boost）：主池
-// 有多个健康账号存在 24h 内到期积分时（CountExpiring24h >= 2），所有 trae 条目
-// 整体排到 cn/global 条目之前——主池积分马上要作废，先用掉，好过被 trae 低价
-// 倍率吸走后白白过期。此前 boost 不生效时退回常规排序。跨渠道主键：「谁先到期
+// groupModelPriority 返回组内模型的**生效优先级**顺序。跨渠道主键：「谁先到期
 // 用谁」——各条目按所属渠道的最早积分到期时刻升序（workbuddy 取主池健康账号的
-// 最早到期批次；trae 按月度重置日估算，见 Gateway.EarliestCreditExpiry）。单渠道
-// 组内所有条目共享同一到期时刻，该键恒平局，退化为原有倍率序，行为不变。次键：
-// 当前生效积分倍率升序（限时免费 = 0 排前），倍率相同的保持配置书写顺序；倍率
-// 或到期时刻未知者整体排在已知者之后。默认模型选取与 /models 列表都以此顺序为准。
+// 最早到期批次；trae 按月度重置日估算，见 Gateway.EarliestCreditExpiry），主池
+// 积分更临期时 cn 条目自然排到 trae 之前，先用掉、好过白白过期。单渠道组内所有
+// 条目共享同一到期时刻，该键恒平局，退化为原有倍率序，行为不变。次键：当前生效
+// 积分倍率升序（限时免费 = 0 排前），倍率相同的保持配置书写顺序；倍率或到期时刻
+// 未知者整体排在已知者之后。默认模型选取与 /models 列表都以此顺序为准。
 // 返回元素为剥掉思考强度后缀的条目原文（"cn:glm-5.3-flash|max" → "cn:glm-5.3-
 // flash"，档位由 groupEffortFor 按 bare 反查）；倍率查找同样基于剥离后的名字。
 func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 	if g == nil || len(g.Models) == 0 {
 		return nil
-	}
-	// boost 判定（组级一次）：主池健康账号中 ≥2 个有 24h 内到期积分 → trae 整体排前。
-	boostTrae := false
-	if h.cfg.Pool != nil && h.cfg.Pool.CountExpiring24h("") >= 2 {
-		boostTrae = true
 	}
 	type cand struct {
 		model  string
@@ -658,7 +651,6 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 		known  bool
 		expiry time.Time // 所属渠道最早积分到期时刻
 		expOK  bool
-		boost  bool // trae 条目在 boost 生效时置位（最高优先级键）
 	}
 	// 渠道到期时刻按 realm 缓存：组内同域条目共享一次查询。
 	expCache := map[string]struct {
@@ -708,15 +700,10 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 		cands = append(cands, cand{
 			model: entry, rate: v, known: err == nil,
 			expiry: expiry, expOK: expOK,
-			boost: boostTrae && realm == "trae",
 		})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		a, b := cands[i], cands[j]
-		// 最高键：主池多账号 24h 内到期时 trae 整体排前（见函数注释）。
-		if a.boost != b.boost {
-			return a.boost
-		}
 		// 主键：跨渠道谁先到期用谁。未知（渠道关闭/无到期信号）排已知之后。
 		if a.expOK != b.expOK {
 			return a.expOK

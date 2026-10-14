@@ -401,46 +401,33 @@ func TestChatGroupDefaultByExpiry(t *testing.T) {
 	}
 }
 
-// TestChatGroupDefaultTraeBoostOnExpiring24h 主池多个健康账号都有 24h 内到期
-// 积分（pkgs 快照口径，含消耗实时扣减）时，跨渠道排序 boost：trae 条目整体排
-// 到 cn 条目之前（CountExpiring24h >= 2），default 也应落在 trae 条目上。
-// 单账号有 24h 内到期（< 2）不 boost——「几个」取最小合理解释为 2。
-func TestChatGroupDefaultTraeBoostOnExpiring24h(t *testing.T) {
+// TestChatGroupDefaultExpiryOrderAcrossRealms 主池账号有临期积分（24h 内到期
+// 批次）时，跨渠道排序「谁先到期用谁」：cn 渠道最早到期批次（今夜 23:00）恒早
+// 于 trae 月度重置估算（次月 1 日 0 点）→ default 必须落在 cn 条目上，把主池
+// 临期积分先用掉。trae 条目写在配置前面也不行——书写序只作同键平局兜底。
+func TestChatGroupDefaultExpiryOrderAcrossRealms(t *testing.T) {
 	up := newRecordUpstream(t)
-	// 两个主池账号：u1/u2 都有 24h 内到期包——满足 CountExpiring24h >= 2；u3
-	// 无包（对照组）。包用 now 相对偏移构造（+8h / +30h），窗口归零仍恒在未来。
+	// 两个主池账号：u1 有 24h 内到期包（今夜 23:00），u2 无（对照组）。
 	p := testPoolWith(
 		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
-		&auth.Auth{UID: "u3", AccessToken: "at3", ExpiresAt: 9999999999},
 	)
 	now := time.Now()
-	pkgAt := func(remind time.Duration) []pool.PkgSnapshot {
-		return []pool.PkgSnapshot{{Remain: 500, ExpireAt: now.Add(remind)}}
+	tonight := time.Date(now.Year(), now.Month(), now.Day(), 23, 0, 0, 0, now.Location())
+	if !tonight.After(now) {
+		tonight = tonight.AddDate(0, 0, 1) // 已过 23:00 则取明晚 23:00，恒在未来
 	}
-	// 明天/后天的固定钟点（时刻无关构造）：now+30h 在 now>18:00 时落到后天
-	// 凌晨（dDays=2 被天粒度窗口排除）导致傍晚后跑测试翻车；改用「明天 12:00」
-	// 与「后天 12:00」的绝对时刻，任何时刻运行都恒为 dDays=1 / dDays=2。
-	tomorrowNoon := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, now.Location()).AddDate(0, 0, 1)
-	dayAfterNoon := tomorrowNoon.AddDate(0, 0, 1)
-	p.SetCreditPackages("u1", pkgAt(8*time.Hour)) // 24h 窗口内
-	p.SetCreditPackages("u2", []pool.PkgSnapshot{{Remain: 500, ExpireAt: tomorrowNoon}})
-	p.SetCreditPackages("u3", []pool.PkgSnapshot{{Remain: 500, ExpireAt: dayAfterNoon}}) // d=2：不在 1 天窗口
-	// 聚合到期信号（EarliestCreditExpiry 的数据源）与包时刻对齐：cn 渠道恒有
-	// 已知到期且早于 trae 重置估算（~9-11 天后），boost 关闭后「谁先到期用谁」
-	// 恒选 cn——测试只让 pkgs 计数驱动 boost 开关，其余键保持受控。
-	p.SetCreditsDetailed("u1", 1000, 0, 0, now.Add(8*time.Hour), 1000)
-	p.SetCreditsDetailed("u2", 1000, 0, 0, tomorrowNoon, 1000)
-	p.SetCreditsDetailed("u3", 1000, 0, 0, dayAfterNoon, 1000)
+	p.SetCreditPackages("u1", []pool.PkgSnapshot{{Remain: 500, ExpireAt: tonight}})
+	p.SetCreditsDetailed("u1", 1000, 0, 0, tonight, 1000)
 
 	groups := []modelgroup.Group{
-		// cn 条目写在前：boost 前它靠书写序/到期序可能排前；boost 后 trae 必须压过它。
-		{Name: "dev", Models: []string{"cn:glm-5.2", "trae:glm-5.2"}},
+		// trae 条目故意写在前：到期序必须压过书写序。
+		{Name: "dev", Models: []string{"trae:glm-5.2", "cn:glm-5.2"}},
 	}
 	tp := traepool.New("")
 	tp.Add(&traeauth.Auth{UID: "t1", AccessToken: "tat", ExpiresAt: 9999999999})
 	// 重置日取「今天+10 天」的日期号（理由同 TestChatGroupDefaultByExpiry）：
-	// trae 重置估算恒在 ~9-11 天后，远晚于 u1/u2 的窗口内包，月末跑也不翻车。
+	// trae 重置估算恒在 ~9-11 天后，远晚于 u1 的窗口内包，月末跑也不翻车。
 	gw := trae.New(trae.Config{
 		Pool: tp, Upstream: traeupstream.New(), WorkMode: "disabled",
 		CreditResetDay: time.Now().AddDate(0, 0, 10).Day(),
@@ -452,33 +439,20 @@ func TestChatGroupDefaultTraeBoostOnExpiring24h(t *testing.T) {
 		t.Fatal("group dev missing")
 	}
 
-	// boost 生效：主池两个账号都有 24h 内到期 → default 落 trae 条目。
-	if n := p.CountExpiring24h(""); n != 2 {
-		t.Fatalf("CountExpiring24h = %d, want 2", n)
-	}
-	if m, _ := h.groupDefaultModel(&g); m != "trae:glm-5.2" {
-		t.Fatalf("boost active: default = %q, want trae:glm-5.2", m)
-	}
-
-	// 扣掉 u1 的包（模拟消耗扣空）：只剩 1 个账号有 24h 内到期 → 不再 boost，
-	// 退回「谁先到期用谁」。u1 批次（今晚 23:00）恒早于 trae 重置估算（次月
-	// 1 日 0 点）→ cn 先到期，default 回 cn 条目。
-	p.SetCreditPackages("u1", nil)
+	// 主池有临期积分（今夜到期）→ cn 先到期，default 落 cn 条目，不得被 trae 抢走。
 	if n := p.CountExpiring24h(""); n != 1 {
-		t.Fatalf("CountExpiring24h after drain u1 = %d, want 1", n)
+		t.Fatalf("CountExpiring24h = %d, want 1", n)
 	}
 	if m, _ := h.groupDefaultModel(&g); m != "cn:glm-5.2" {
-		t.Fatalf("boost off (<2 accounts): default = %q, want cn:glm-5.2 (expiry order)", m)
+		t.Fatalf("cn expiring: default = %q, want cn:glm-5.2 (expiry order)", m)
 	}
 
-	// u2 的包也扣掉：无窗口内到期账号 → 依旧 cn 条目（u2 明天 12:00 仍早于
-	// trae 重置，到期序不变）。
-	p.SetCreditPackages("u2", nil)
-	if n := p.CountExpiring24h(""); n != 0 {
-		t.Fatalf("CountExpiring24h after drain u2 = %d, want 0", n)
-	}
-	if m, _ := h.groupDefaultModel(&g); m != "cn:glm-5.2" {
-		t.Fatalf("boost off (0 accounts): default = %q, want cn:glm-5.2", m)
+	// 扣掉 u1 的包：cn 渠道无到期信号 → expOK=false 排到 trae（有估算信号）之后，
+	// default 回落 trae 条目（倍率均未知，保持书写序）。
+	p.SetCreditPackages("u1", nil)
+	p.SetCreditsDetailed("u1", 1000, 0, 0, time.Time{}, 1000)
+	if m, _ := h.groupDefaultModel(&g); m != "trae:glm-5.2" {
+		t.Fatalf("cn expiry unknown: default = %q, want trae:glm-5.2", m)
 	}
 }
 
