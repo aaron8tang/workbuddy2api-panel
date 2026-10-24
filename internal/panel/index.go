@@ -9,8 +9,11 @@
 package panel
 
 import (
+	"crypto/sha1"
 	_ "embed"
+	"encoding/hex"
 	"net/http"
+	"strconv"
 )
 
 //go:embed index.html
@@ -18,6 +21,17 @@ var indexHTML []byte
 
 //go:embed app.js
 var appJS []byte
+
+// appETag 静态资源内容指纹（启动时算一次）：升级二进制后内容必变，浏览器
+// 协商缓存立即拿到新脚本——没有它，改了 app.js 用户侧可能永远停在旧缓存
+//（此前 chips 正则升级后用户看不到新渠道模型就是这个问题）。
+var appETag = `"` + etagOf(appJS) + `"`
+var htmlETag = `"` + etagOf(indexHTML) + `"`
+
+func etagOf(b []byte) string {
+	sum := sha1.Sum(b)
+	return hex.EncodeToString(sum[:10])
+}
 
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
 //   - default-src 'none'        默认全禁，逐个开口
@@ -44,18 +58,29 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 }
 
+// serveStatic 静态资源统一出口：ETag 协商缓存 + no-cache（内容变了浏览器立即可见，
+// 没变回 304 省流量）。面板是常驻刷新的运维界面，陈旧脚本的代价（功能缺失/渲染错乱）
+// 远大于每次一次 304 往返。
+func serveStatic(w http.ResponseWriter, r *http.Request, body []byte, etag, contentType string) {
+	setSecurityHeaders(w)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "no-cache")
+	if match := r.Header.Get("If-None-Match"); match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(indexHTML)
+	serveStatic(w, r, indexHTML, htmlETag, "text/html; charset=utf-8")
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(appJS)
+	serveStatic(w, r, appJS, appETag, "text/javascript; charset=utf-8")
 }

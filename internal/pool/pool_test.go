@@ -1742,8 +1742,9 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 
 // TestPickExpiringHardTier 快过期硬优先：存在有效快过期候选时，普通账号中签率
 // 必须为 0（×3 软加权时代普通号每个新会话仍有 ~10% 概率被抽中——14:07 素素实案：
-// 31 天后才有积分到期的号被选中并粘性锁 30 分钟）；关闭 prefer_expiring 恢复旧
-// 软加权语义，普通账号重新参与抽签。
+// 31 天后才有积分到期的号被选中并粘性锁 30 分钟）。收敛到临期层后按批次最早
+// 到期时分秒 FEFO 取首：轮询序 = 到期序，不再加权随机分布；排除首选（请求级
+// 轮转）后轮到次早者。关闭 prefer_expiring 恢复旧软加权语义。
 func TestPickExpiringHardTier(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
@@ -1758,16 +1759,21 @@ func TestPickExpiringHardTier(t *testing.T) {
 
 	rng := rand.New(rand.NewPCG(1, 2))
 	p.SetRandomSource(func(n int64) int64 { return rng.Int64N(n) })
-	counts := map[string]int{}
-	for i := 0; i < 500; i++ {
+
+	// FEFO 取首：连续选号恒命中最早到期的 soon（2h < 47h）。
+	for i := 0; i < 20; i++ {
 		got := p.Pick()
 		if got == nil {
 			t.Fatal("pick returned nil")
 		}
-		counts[got.UID]++
+		if got.UID != "soon" {
+			t.Fatalf("iter %d: pick=%s, want soon (earliest expiry wins FEFO)", i, got.UID)
+		}
 	}
-	if counts["none"] != 0 || counts["soon"] == 0 || counts["later"] == 0 {
-		t.Fatalf("hard tier distribution=%v, want only expiring accounts picked", counts)
+
+	// 排除 soon（请求级轮转）→ 轮到次早到期的 later；none 必须落选。
+	if got := p.PickExcluding(map[string]bool{"soon": true}); got == nil || got.UID != "later" {
+		t.Fatalf("pick=%v, want later after soon excluded", got)
 	}
 
 	// 关闭开关：恢复旧语义，普通账号重新可见。
@@ -1781,6 +1787,186 @@ func TestPickExpiringHardTier(t *testing.T) {
 	}
 	if !seenNone {
 		t.Fatal("prefer_expiring=false should restore non-expiring accounts into the draw")
+	}
+}
+
+// TestPickExpiringSecondsFEFO 批次积分到期时分秒 FEFO（秒级精度）：两个临期账号
+// 只差 90 秒过期时，先用掉只多活 90 秒的那份；pkgs 逐包明细优先于签到快照
+// （NoteModelCost 每调用 FEFO 实时扣减，精度最高），明细挂上更早批次后首选换位。
+func TestPickExpiringSecondsFEFO(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "early"}) // 90 秒后过期
+	p.Add(&auth.Auth{UID: "late"})  // 3 分钟后过期
+	p.Add(&auth.Auth{UID: "none"})  // 无临期积分（保证临期层收敛为真子集）
+
+	now := time.Now()
+	p.SetCreditsDetailed("early", 100, 100, 50, now.Add(90*time.Second), 50)
+	p.SetCreditsDetailed("late", 100, 100, 50, now.Add(3*time.Minute), 50)
+	p.SetCreditsDetailed("none", 100, 100, 0, time.Time{}, 0)
+
+	for i := 0; i < 10; i++ {
+		if got := p.Pick(); got == nil || got.UID != "early" {
+			t.Fatalf("iter %d: pick=%v, want early (expires 90s before late)", i, got)
+		}
+	}
+
+	// pkgs 明细优先：late 挂上 30 秒后过期的更早批次 → 首选从 early 换成 late
+	p.SetCreditPackages("late", []PkgSnapshot{{Remain: 10, ExpireAt: now.Add(30 * time.Second)}})
+	if got := p.Pick(); got == nil || got.UID != "late" {
+		t.Fatalf("pick=%v, want late (pkg detail with earliest second-level expiry)", got)
+	}
+}
+
+// TestPickExpiringPkgsSignal 修复 B：包明细（pkgs）信号并入 expiringNow。
+// 账号聚合快照三字段缺失（上游明细缺批次时的真实形态），但 pkgs 里有窗口内
+// 到期的批次——注窗口后该号必须进入硬过滤层。全局 FEFO 键（TestPickFEFOGlobal
+// Order）落地后，pkgsOnly 仅剩窗口外批次时仍按 FEFO 全局序优先于无明细账号
+//（25h 批次照样先于无明细用掉）；硬过滤层语义保留：窗口内批次存在时压过一切
+// 非临期号（关闭 prefer_expiring 恢复纯加权）。
+func TestPickExpiringPkgsSignal(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "pkgsOnly"}) // 仅 pkgs 有临期批次，聚合快照全空
+	p.Add(&auth.Auth{UID: "none"})
+	now := time.Now()
+	p.SetCreditsDetailed("pkgsOnly", 100, 100, 0, time.Time{}, 0)
+	p.SetCreditsDetailed("none", 100, 100, 0, time.Time{}, 0)
+	p.SetCreditPackages("pkgsOnly", []PkgSnapshot{
+		{Remain: 5, ExpireAt: now.Add(20 * time.Hour)},  // 24h 窗口内
+		{Remain: 95, ExpireAt: now.Add(30 * 24 * time.Hour)},
+	})
+
+	// 注入窗口 24h：pkgsOnly 命中包明细信号，硬过滤收敛到它。
+	p.SetExpiringSoonWindow(24 * time.Hour)
+	for i := 0; i < 10; i++ {
+		if got := p.Pick(); got == nil || got.UID != "pkgsOnly" {
+			t.Fatalf("iter %d: pick=%v, want pkgsOnly (pkg batch expires within window)", i, got)
+		}
+	}
+
+	// 关闭开关：恢复旧语义，普通账号重新可见（FEFO 全局键一并关闭）。
+	p.SetPreferExpiring(false)
+	seenNone := false
+	for i := 0; i < 500; i++ {
+		if got := p.Pick(); got != nil && got.UID == "none" {
+			seenNone = true
+			break
+		}
+	}
+	if !seenNone {
+		t.Fatal("prefer_expiring=false should restore non-expiring accounts into the draw")
+	}
+
+	// 重开开关 + 批次全部移出窗口（25h）：硬过滤层不再收敛，但全局 FEFO 键
+	// 仍把 25h 批次的 pkgsOnly 排在无明细 none 之前（先到期先用，谁先到期用谁
+	// 不依赖窗口）。
+	p.SetPreferExpiring(true)
+	p.SetCreditPackages("pkgsOnly", []PkgSnapshot{
+		{Remain: 5, ExpireAt: now.Add(25 * time.Hour)},
+		{Remain: 95, ExpireAt: now.Add(30 * 24 * time.Hour)},
+	})
+	for i := 0; i < 10; i++ {
+		if got := p.Pick(); got == nil || got.UID != "pkgsOnly" {
+			t.Fatalf("iter %d: pick=%v, want pkgsOnly (global FEFO: earlier batch beats no-detail)", i, got)
+		}
+	}
+}
+
+// TestPickFEFOGlobalOrder 全局 FEFO 排序键：所有账号都超出快过期窗口时（2026-10
+// 实案：7 个号最早批次 38h~397h 后，临期层收缩不触发、退化为纯加权随机，16 天后
+// 才到期的素素照样被抽中），有批次明细的账号按最早到期时刻升序恒排在无明细/更晚
+// 明细者之前——2 天后到期的 jiujiu 恒先于 16 天后到期的素素。扣减（NoteModelCost
+// → consumePkgsLocked）实时清掉最早批次后自动让位。无明细的账号垫底但仍参与抽签
+//（全部无明细时退化为权重随机，老部署零回归）。
+func TestPickFEFOGlobalOrder(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	// 窗口注入 24h：三号的批次都在窗口外（临期层不触发），纯靠全局 FEFO 键排序。
+	p.SetExpiringSoonWindow(24 * time.Hour)
+	p.Add(&auth.Auth{UID: "soon2d"})  // 2 天后到期
+	p.Add(&auth.Auth{UID: "far16d"})  // 16 天后到期（素素实案）
+	p.Add(&auth.Auth{UID: "nodetail"}) // 无批次明细
+	now := time.Now()
+	p.SetCreditPackages("soon2d", []PkgSnapshot{
+		{Remain: 100, ExpireAt: now.Add(2 * 24 * time.Hour)},
+	})
+	p.SetCreditPackages("far16d", []PkgSnapshot{
+		{Remain: 5000, ExpireAt: now.Add(16 * 24 * time.Hour)},
+	})
+
+	rng := rand.New(rand.NewPCG(7, 8))
+	p.SetRandomSource(func(n int64) int64 { return rng.Int64N(n) })
+
+	// FEFO 全局序：2 天批次的 soon2d 恒先于 16 天批次的 far16d 与无明细 nodetail。
+	for i := 0; i < 20; i++ {
+		got := p.Pick()
+		if got == nil {
+			t.Fatal("pick returned nil")
+		}
+		if got.UID != "soon2d" {
+			t.Fatalf("iter %d: pick=%s, want soon2d (global FEFO: earliest batch first)", i, got.UID)
+		}
+	}
+
+	// 排除 soon2d → 16 天批次的 far16d 先于无明细的 nodetail。
+	if got := p.PickExcluding(map[string]bool{"soon2d": true}); got == nil || got.UID != "far16d" {
+		t.Fatalf("pick=%v, want far16d (earlier batch beats no-detail)", got)
+	}
+
+	// 扣减让位：NoteModelCost 需要账号有聚合余额（扣减钳 credits）——补设后
+	// 两次扣费累积越过 soon2d 的最早批次（100），consumePkgsLocked 删包 →
+	// fefo 归零 → FEFO 首选换成 far16d。
+	p.SetCreditsDetailed("soon2d", 200, 200, 0, time.Time{}, 0)
+	p.NoteModelCost("soon2d", "m", 50, 1000) // creditFrac=50 → 扣 50，批次 100→50
+	if got := p.Pick(); got == nil || got.UID != "soon2d" {
+		t.Fatalf("after partial consume pick=%v, want soon2d (batch remain>0 still earliest)", got)
+	}
+	p.NoteModelCost("soon2d", "m", 60, 1000) // creditFrac=60 → 扣 60，批次 50 扣穿删除
+	if got := p.Pick(); got == nil || got.UID != "far16d" {
+		t.Fatalf("after consume-through pick=%v, want far16d (soon2d batch exhausted)", got)
+	}
+}
+
+// TestNoteModelCostFractionalAccumulation 修复 A：小额扣费（0.2~0.4 credit/笔）
+// 不再被四舍五入吞成 0。累积满 1 才扣：4 笔 0.25 → 扣 1；权威余额写入
+// （SetCredits）重置累积器，防权威刷新后残留双扣。
+func TestNoteModelCostFractionalAccumulation(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCreditsDetailed("u1", 10, 10, 10, time.Now().Add(time.Hour), 10)
+
+	// 3 笔 0.25：累积 0.75 < 1，不扣。
+	for i := 0; i < 3; i++ {
+		p.NoteModelCost("u1", "m", 0.25, 1000)
+	}
+	st, _ := p.Status("u1")
+	if st.Credits != 10 || st.CreditsExpiring != 10 || st.CreditsEarliestRemaining != 10 {
+		t.Fatalf("3x0.25 must not deduct yet: %+v", st)
+	}
+
+	// 第 4 笔：累积满 1 → 扣 1。
+	p.NoteModelCost("u1", "m", 0.25, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 9 || st.CreditsExpiring != 9 || st.CreditsEarliestRemaining != 9 {
+		t.Fatalf("4x0.25 must deduct exactly 1: %+v", st)
+	}
+
+	// 权威余额写入重置累积器：SetCreditsDetailed(9.75 折算的权威值 10，余额 10)
+	// 后再 0.5+0.5 → 扣 1 而非残留 0.75 导致首笔就扣。
+	p.SetCreditsDetailed("u1", 9, 9, 9, time.Now().Add(time.Hour), 9)
+	p.NoteModelCost("u1", "m", 0.5, 1000)
+	p.NoteModelCost("u1", "m", 0.5, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 8 {
+		t.Fatalf("authoritative reset then 0.5+0.5 must deduct 1: %+v", st)
+	}
+
+	// 大额扣费不受影响（原四舍五入语义 → floor 语义）：2.9 一次扣 2。
+	p.NoteModelCost("u1", "m", 2.9, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 6 {
+		t.Fatalf("2.9 must deduct 2 (floor): %+v", st)
 	}
 }
 
@@ -2107,7 +2293,7 @@ func TestSharedModelCostFloorUsesSharedObservation(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
 	p.SetCreditFloor(100)
-	p.SetCredits("u1", 50, 0) // 触底（NoteModelCost 顺扣余额：50-3=47，仍触底）
+	p.SetCredits("u1", 50, 0) // 触底（NoteModelCost 顺扣余额：50-2=48，仍触底）
 	p.SetCredits("u2", 50, 0) // 触底
 	// 仅 u1 实测收费；u2 无账号级观测。
 	p.NoteModelCost("u1", "m", 2.9, 1000)

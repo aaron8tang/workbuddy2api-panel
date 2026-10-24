@@ -202,6 +202,11 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
    在 header 里会把标题挤成两行、把"近 3 天"这类短选项拉成一整条。 */
 .box > header select, .box > header input { width: auto; }
 .box > header h3 { white-space: nowrap; }
+/* 模型视图的 header hint 是一整句使用说明：全局 nowrap 会把 h3 撑成超宽单行，
+   把同 header 里右侧的 mgNote 计数与「新建模型组」按钮一起推出边界，再被
+   .box 的 overflow:hidden 裁掉（按钮看得见 DOM、看不见渲染）。此处恢复换行，
+   hint 折行显示，按钮回到行内。 */
+#view-models .box > header h3 { white-space: normal; }
 .box .pad { padding: 17px; }
 
 /* ── 账号表（签名元素：健康色条 + 积分量条）───────────────────────── */
@@ -594,7 +599,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     border-radius: 8px; background: var(--surface); color: var(--ink); font: inherit; font-size: 12.5px; }
   textarea.mg-input { resize: vertical; font-family: var(--mono); line-height: 1.55; }
   .mg-input:focus { outline: none; border-color: var(--accent); }
-  .mg-chips { flex: 1; display: flex; flex-wrap: wrap; gap: 5px; align-content: flex-start; padding-top: 4px; }
+  .mg-chips { flex: 1; display: flex; flex-wrap: wrap; gap: 5px; align-content: flex-start; padding-top: 4px; max-height: 190px; overflow-y: auto; }
   .mg-chip { cursor: pointer; user-select: none; }
   .mg-chip:hover { filter: brightness(1.08); }
   .mg-chip.used { opacity: .38; pointer-events: none; }
@@ -618,6 +623,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#trae" data-view="trae">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.2" y="2.2" width="11.6" height="11.6" rx="2.4"/><path d="M5.4 8h5.2M8 5.4v5.2"/></svg>
         TRAE 渠道</a></li>
+      <li><a href="#cosy" data-view="cosy">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
+        Qoder 渠道</a></li>
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
@@ -693,7 +701,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
             <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th class="num" title="24 小时内到期作废的积分合计">24h到期</th><th class="num" title="48 小时内到期作废的积分合计">48h到期</th><th class="num">最早到期</th><th class="c-acts"></th>
+            <th>成功 / 失败</th><th>在途</th><th>用量</th><th class="num" title="24 小时窗口内到期作废的积分合计（按天粒度：明天内到期的批次都计入，实际到期时刻看「最早到期」列）">24h到期</th><th class="num" title="48 小时窗口内到期作废的积分合计（按天粒度：后天内到期的批次都计入）">48h到期</th><th class="num">最早到期</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
@@ -759,10 +767,248 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <table class="acc">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th><th class="num" title="24 小时内到期作废的积分合计">24h到期</th><th class="num" title="48 小时内到期作废的积分合计">48h到期</th><th>积分到期</th><th>Token 到期</th><th class="c-acts"></th>
+            <th>账号</th><th>状态</th><th>积分</th><th class="num" title="24 小时窗口内到期作废的积分合计（按天粒度：明天内到期的批次都计入，实际到期时刻看「积分到期」列）">24h到期</th><th class="num" title="48 小时窗口内到期作废的积分合计（按天粒度：后天内到期的批次都计入）">48h到期</th><th>积分到期</th><th>Token 到期</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="traeBody"></tbody>
         </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Qoder 渠道（COSY 协议族三渠道：qoder / qoderwork / qwenwork） -->
+    <section class="view" id="view-cosy" hidden>
+      <div class="box" id="cosyDisabled" hidden>
+        <header><h3>渠道未启用</h3></header>
+        <div class="pad"><div class="empty"><div class="big">三个渠道均未启用或未装配</div>在 config.json 的 qoder / qoderwork / qwenwork 段启用（缺省已启用）并重启进程后，这里可管理各渠道账号；渠道模型以 qoder: / qoderwork: / qwenwork: 前缀暴露。</div></div>
+      </div>
+      <div id="cosyMain">
+        <div class="box" id="cosyBox-qoder" hidden>
+          <header>
+            <h3>Qoder <span class="hint">设备流登录或导入凭证 JSON（qoder-&lt;uid&gt;.json）；模型以 qoder: 前缀暴露；订阅缺失只软冷却不禁用账号</span></h3>
+            <span class="grow"></span>
+            <span class="note" id="cosyNote-qoder"></span>
+            <button class="xs" id="btnCosyImportToggle-qoder">导入凭证</button>
+            <button class="xs primary" id="btnCosyLogin-qoder">设备流登录</button>
+          </header>
+          <div class="pad" id="cosyLoginPad-qoder" hidden>
+            <div class="mg-row">
+              <span class="mg-label">登录</span>
+              <span class="note" id="cosyLoginMsg-qoder">正在生成登录链接…</span>
+            </div>
+            <div class="mg-row">
+              <span class="mg-label">链接</span>
+              <span class="mg-mono" id="cosyLoginUrl-qoder" style="overflow-wrap:anywhere"></span>
+              <button class="xs" id="btnCosyOpenUrl-qoder">打开</button>
+              <button class="xs" id="btnCosyCopyUrl-qoder">复制</button>
+              <button class="xs ghost" id="btnCosyCancelLogin-qoder">取消</button>
+            </div>
+          </div>
+          <div class="pad" id="cosyImportPad-qoder" hidden>
+            <div class="mg-row">
+              <span class="mg-label">导入</span>
+              <textarea id="cosyImportText-qoder" class="mg-input" rows="3" style="flex:1" placeholder="粘贴账号凭证 JSON（嵌套/扁平均可）"></textarea>
+              <button class="xs primary" id="btnCosyImport-qoder">导入</button>
+              <span class="note" id="cosyImportNote-qoder"></span>
+            </div>
+          </div>
+          <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr><th class="mark" aria-hidden="true"></th><th>账号</th><th>状态</th><th>Token 到期</th><th class="c-acts"></th></tr></thead>
+            <tbody id="cosyBody-qoder"></tbody>
+          </table>
+          </div>
+        </div>
+
+        <div class="box" id="cosyBox-qoderwork" hidden>
+          <header>
+            <h3>QoderWork <span class="hint">设备流登录（浏览器授权页）或导入凭证 JSON（qoderwork-&lt;uid&gt;.json，嵌套/扁平均可）；模型以 qoderwork: 前缀暴露；余额耗尽硬冷却到次日 4 点</span></h3>
+            <span class="grow"></span>
+            <span class="note" id="cosyNote-qoderwork"></span>
+            <button class="xs" id="btnCosyImportToggle-qoderwork">导入凭证</button>
+            <button class="xs primary" id="btnCosyLogin-qoderwork">设备流登录</button>
+            <button class="xs" id="btnCosyModels-qoderwork" title="强制重拉动态模型目录（1 小时缓存即刻失效）">刷新模型</button>
+            <button class="xs" id="btnCosyCheckin-qoderwork">全部签到</button>
+          </header>
+          <div class="pad" id="cosyLoginPad-qoderwork" hidden>
+            <div class="mg-row">
+              <span class="mg-label">登录</span>
+              <span class="note" id="cosyLoginMsg-qoderwork">正在生成登录链接…</span>
+            </div>
+            <div class="mg-row">
+              <span class="mg-label">链接</span>
+              <span class="mg-mono" id="cosyLoginUrl-qoderwork" style="overflow-wrap:anywhere"></span>
+              <button class="xs" id="btnCosyOpenUrl-qoderwork">打开</button>
+              <button class="xs" id="btnCosyCopyUrl-qoderwork">复制</button>
+              <button class="xs ghost" id="btnCosyCancelLogin-qoderwork">取消</button>
+            </div>
+          </div>
+          <div class="pad" id="cosyImportPad-qoderwork" hidden>
+            <div class="mg-row">
+              <span class="mg-label">导入</span>
+              <textarea id="cosyImportText-qoderwork" class="mg-input" rows="3" style="flex:1" placeholder="粘贴账号凭证 JSON（嵌套 auth/account 或扁平形态）"></textarea>
+              <button class="xs primary" id="btnCosyImport-qoderwork">导入</button>
+              <span class="note" id="cosyImportNote-qoderwork"></span>
+            </div>
+          </div>
+          <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr><th class="mark" aria-hidden="true"></th><th>账号</th><th>状态</th><th>余额</th><th>DT 到期</th><th class="c-acts"></th></tr></thead>
+            <tbody id="cosyBody-qoderwork"></tbody>
+          </table>
+          </div>
+        </div>
+
+        <div class="box" id="cosyBox-qwenwork" hidden>
+          <header>
+            <h3>千问办公 <span class="hint">设备流登录（浏览器授权页，与 CN CLI 同源）或导入解密 auth-v2.dat 凭证 JSON（qwenwork-&lt;uid&gt;.json，schemaVersion 2 形态）；模型以 qwenwork: 前缀暴露</span></h3>
+            <span class="grow"></span>
+            <span class="note" id="cosyNote-qwenwork"></span>
+            <button class="xs" id="btnCosyImportToggle-qwenwork">导入凭证</button>
+            <button class="xs primary" id="btnCosyLogin-qwenwork">设备流登录</button>
+            <button class="xs" id="btnCosyModels-qwenwork" title="强制重拉动态模型目录">刷新模型</button>
+          </header>
+          <div class="pad" id="cosyLoginPad-qwenwork" hidden>
+            <div class="mg-row">
+              <span class="mg-label">登录</span>
+              <span class="note" id="cosyLoginMsg-qwenwork">正在生成登录链接…</span>
+            </div>
+            <div class="mg-row">
+              <span class="mg-label">链接</span>
+              <span class="mg-mono" id="cosyLoginUrl-qwenwork" style="overflow-wrap:anywhere"></span>
+              <button class="xs" id="btnCosyOpenUrl-qwenwork">打开</button>
+              <button class="xs" id="btnCosyCopyUrl-qwenwork">复制</button>
+              <button class="xs ghost" id="btnCosyCancelLogin-qwenwork">取消</button>
+            </div>
+          </div>
+          <div class="pad" id="cosyImportPad-qwenwork" hidden>
+            <div class="mg-row">
+              <span class="mg-label">导入</span>
+              <textarea id="cosyImportText-qwenwork" class="mg-input" rows="3" style="flex:1" placeholder="粘贴解密后的 auth-v2.dat JSON（含 token / refreshToken / user 字段）"></textarea>
+              <button class="xs primary" id="btnCosyImport-qwenwork">导入</button>
+              <span class="note" id="cosyImportNote-qwenwork"></span>
+            </div>
+          </div>
+          <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr><th class="mark" aria-hidden="true"></th><th>账号</th><th>状态</th><th>Token 到期</th><th class="c-acts"></th></tr></thead>
+            <tbody id="cosyBody-qwenwork"></tbody>
+          </table>
+          </div>
+        </div>
+        <div class="box" id="cosyBox-codearts" hidden>
+          <header>
+            <h3>CodeArts <span class="hint">华为云 CodeArts：Web 登录（portal 授权后自动回调落盘）或导入凭证 JSON（codearts-&lt;uid&gt;.json）；模型以 codearts: 前缀暴露；3 路并发/账号（心跳闸门），403 额度冷却</span></h3>
+            <span class="grow"></span>
+            <span class="note" id="cosyNote-codearts"></span>
+            <button class="xs" id="btnCosyImportToggle-codearts">导入凭证</button>
+            <button class="xs primary" id="btnCosyLogin-codearts">Web 登录</button>
+            <button class="xs" id="btnCosyModels-codearts" title="强制重拉模型目录（agent/builtin/benefit 三源合并）">刷新模型</button>
+          </header>
+          <div class="pad" id="cosyLoginPad-codearts" hidden>
+            <div class="mg-row">
+              <span class="mg-label">登录</span>
+              <span class="note" id="cosyLoginMsg-codearts">正在生成登录链接…</span>
+            </div>
+            <div class="mg-row">
+              <span class="mg-label">链接</span>
+              <span class="mg-mono" id="cosyLoginUrl-codearts" style="overflow-wrap:anywhere"></span>
+              <button class="xs" id="btnCosyOpenUrl-codearts">打开</button>
+              <button class="xs" id="btnCosyCopyUrl-codearts">复制</button>
+              <button class="xs ghost" id="btnCosyCancelLogin-codearts">取消</button>
+            </div>
+          </div>
+          <div class="pad" id="cosyImportPad-codearts" hidden>
+            <div class="mg-row">
+              <span class="mg-label">导入</span>
+              <textarea id="cosyImportText-codearts" class="mg-input" rows="3" style="flex:1" placeholder="粘贴 CodeArts 凭证 JSON（access_key_id / secret_access_key / security_token / refresh_token / oauth_context）"></textarea>
+              <button class="xs primary" id="btnCosyImport-codearts">导入</button>
+              <span class="note" id="cosyImportNote-codearts"></span>
+            </div>
+          </div>
+          <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr><th class="mark" aria-hidden="true"></th><th>账号</th><th>状态</th><th>凭据到期</th><th class="c-acts"></th></tr></thead>
+            <tbody id="cosyBody-codearts"></tbody>
+          </table>
+          </div>
+        </div>
+
+        <div class="box" id="cosyBox-officeace" hidden>
+          <header>
+            <h3>OfficeAce <span class="hint">华为云果办：Web 登录（云端轮询取码）或导入凭证 JSON（officeace-*.json，含 modelAppKey/modelAppSecret）；模型以 officeace: 前缀暴露；网关 Basic 不过期，控制面自动续期</span></h3>
+            <span class="grow"></span>
+            <span class="note" id="cosyNote-officeace"></span>
+            <button class="xs" id="btnCosyImportToggle-officeace">导入凭证</button>
+            <button class="xs primary" id="btnCosyLogin-officeace">Web 登录</button>
+            <button class="xs" id="btnCosyModels-officeace" title="强制重拉模型目录 + 可用性探测">刷新模型</button>
+            <button class="xs" id="btnCosyCheckin-officeace">全部签到</button>
+          </header>
+          <div class="pad" id="cosyLoginPad-officeace" hidden>
+            <div class="mg-row">
+              <span class="mg-label">登录</span>
+              <span class="note" id="cosyLoginMsg-officeace">正在生成登录链接…</span>
+            </div>
+            <div class="mg-row">
+              <span class="mg-label">链接</span>
+              <span class="mg-mono" id="cosyLoginUrl-officeace" style="overflow-wrap:anywhere"></span>
+              <button class="xs" id="btnCosyOpenUrl-officeace">打开</button>
+              <button class="xs" id="btnCosyCopyUrl-officeace">复制</button>
+              <button class="xs ghost" id="btnCosyCancelLogin-officeace">取消</button>
+            </div>
+          </div>
+          <div class="pad" id="cosyImportPad-officeace" hidden>
+            <div class="mg-row">
+              <span class="mg-label">导入</span>
+              <textarea id="cosyImportText-officeace" class="mg-input" rows="3" style="flex:1" placeholder="粘贴 OfficeAce 凭证 JSON（baseUrl / modelAppKey / modelAppSecret / refreshToken / dpopKeyPair）"></textarea>
+              <button class="xs primary" id="btnCosyImport-officeace">导入</button>
+              <span class="note" id="cosyImportNote-officeace"></span>
+            </div>
+          </div>
+          <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr><th class="mark" aria-hidden="true"></th><th>账号</th><th>状态</th><th>控制面到期</th><th class="c-acts"></th></tr></thead>
+            <tbody id="cosyBody-officeace"></tbody>
+          </table>
+          </div>
+        </div>
+        <div class="box" id="cosyBox-autoclaw" hidden>
+          <header>
+            <h3>AutoClaw <span class="hint">智谱 autoglm：手机验证码登录（发码 → 填验证码）或导入 token（明文 JWT / enc: 密文 / 桌面端 auth.json 整包）；模型以 autoclaw: 前缀暴露；refresh token 一次性轮换（每小时自动续）</span></h3>
+            <span class="grow"></span>
+            <span class="note" id="cosyNote-autoclaw"></span>
+            <button class="xs" id="btnCosyImportToggle-autoclaw">导入凭证</button>
+            <button class="xs primary" id="btnCosyLogin-autoclaw">手机登录</button>
+            <button class="xs primary" id="btnAcDesktop-autoclaw" title="读本机 %APPDATA%\AutoClaw\auth.json 并解密（仅 Windows）">导入桌面端登录态</button>
+            <button class="xs" id="btnCosyModels-autoclaw" title="强制重拉模型目录">刷新模型</button>
+            <button class="xs" id="btnCosyCheckin-autoclaw">签到</button>
+          </header>
+          <div class="pad" id="cosyLoginPad-autoclaw" hidden>
+            <div class="mg-row">
+              <span class="mg-label">手机号</span>
+              <input class="mg-input" id="cosyPhone-autoclaw" style="flex:1" placeholder="11 位手机号" />
+              <button class="xs primary" id="btnCosySend-autoclaw">发验证码</button>
+            </div>
+            <div class="mg-row">
+              <span class="mg-label">验证码</span>
+              <input class="mg-input" id="cosyCode-autoclaw" style="flex:1" placeholder="短信里的数字" />
+              <button class="xs primary" id="btnCosyVerify-autoclaw">登录</button>
+              <span class="note" id="cosyLoginMsg-autoclaw"></span>
+            </div>
+          </div>
+          <div class="pad" id="cosyImportPad-autoclaw" hidden>
+            <div class="mg-row">
+              <span class="mg-label">导入</span>
+              <textarea id="cosyImportText-autoclaw" class="mg-input" rows="3" style="flex:1" placeholder='粘贴 token JSON：{"token":"eyJ...","refresh_token":"...","device_id":"..."} 或 {"desktop_auth_json":"{...}"}'></textarea>
+              <button class="xs primary" id="btnCosyImport-autoclaw">导入</button>
+              <span class="note" id="cosyImportNote-autoclaw"></span>
+            </div>
+          </div>
+          <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr><th class="mark" aria-hidden="true"></th><th>账号</th><th>状态</th><th>token 到期</th><th class="c-acts"></th></tr></thead>
+            <tbody id="cosyBody-autoclaw"></tbody>
+          </table>
+          </div>
         </div>
       </div>
     </section>
@@ -851,6 +1097,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="cn">国内版 CN</option>
             <option value="global">国际版 Global</option>
             <option value="trae">TRAE 渠道</option>
+            <option value="qoder">Qoder</option>
+            <option value="qoderwork">QoderWork</option>
+            <option value="qwenwork">千问办公</option>
           </select>
           <select id="mdCap" aria-label="按能力筛选">
             <option value="">全部能力</option>
@@ -1065,6 +1314,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="growth_hours" placeholder="1">
                 <span class="hint">每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</span></label>
             </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <div class="switch"><span class="lb">渠道账号自动签到</span>
+                <input type="checkbox" name="channel_checkin_enabled"></div>
+              <label class="fld"><span class="lb">排除渠道（逗号分隔，可留空）</span>
+                <input name="channel_checkin_exclude" placeholder="例如：codearts, autoclaw">
+                <span class="hint">已启用且有账号的渠道，在签到时点一并执行各自每日动作（trae 签到 / qoderwork 领签到 / codearts 福利池 / officeace 领奖励 / autoclaw 签到+活跃）。留空 = 全部参与。改动需重启。</span></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <div class="switch"><span class="lb">跨渠道失败转移</span>
+                <input type="checkbox" name="failover_enabled"></div>
+              <label class="fld"><span class="lb">排除渠道（逗号分隔，可留空）</span>
+                <input name="failover_exclude" placeholder="例如：autoclaw, officeace">
+                <span class="hint">单渠道连续失败（或该渠道无可用账号）时，自动把请求交给下一个渠道，直到全部尝试完或成功为止——不再把错误直接透传给客户端。新渠道自动纳入。留空 = 全部参与。改动需重启。</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">单请求最多尝试渠道数</span>
+                <input name="failover_max_channels" type="number" min="0" placeholder="0 = 不限"></label>
+              <div class="switch"><span class="lb">积分耗尽时停止转移</span>
+                <input type="checkbox" name="failover_skip_on_credit"></div>
+            </div>
+            <div class="hint">积分耗尽（额度用完）默认<b>照常转移</b>：各渠道额度独立，本渠道没钱不代表别的渠道没钱。勾上则视为停止信号。<br>请求级错误（参数错 / prompt 过长 / 图片无效 / 内容拦截）与上游超时<b>一律不转移</b>——换渠道必然同样失败，转移只会把一次请求放大成 N 次。</div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
               <input type="checkbox" name="include_disabled_in_tasks"></div>

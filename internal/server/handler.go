@@ -20,13 +20,19 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/autoclaw"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/codearts"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelgroup"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/officeace"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/promptcache"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qoder"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qoderwork"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qwenwork"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
@@ -85,7 +91,48 @@ type Config struct {
 	// nil 时 "trae:" 前缀模型名不被识别（恒走主链路并因模型不存在而 404/400），
 	// /v1/models 不追加 trae 条目，/healthz 不含 trae 分档——主链路零回归。
 	Trae *trae.Gateway
+
+	// Qoder / QoderWork / QwenWork COSY 协议族三渠道门面（可选；nil = 渠道关闭）。
+	// 语义同 Trae："qoder:"/"qoderwork:"/"qwenwork:" 前缀模型名分发到对应子系统，
+	// nil 时前缀不被识别（恒走主链路 404/400），/v1/models 不追加条目。
+	Qoder     *qoder.Gateway
+	QoderWork *qoderwork.Gateway
+	QwenWork  *qwenwork.Gateway
+
+	// CodeArts / OfficeAce 华为云两渠道门面（可选；nil = 渠道关闭）。
+	// 语义同 Trae："codearts:"/"officeace:" 前缀模型名分发到对应子系统。
+	CodeArts  *codearts.Gateway
+	OfficeAce *officeace.Gateway
+
+	// AutoClaw 智谱 autoglm 渠道门面（可选；nil = 渠道关闭）。
+	// 语义同 Trae："autoclaw:" 前缀模型名分发到对应子系统。
+	AutoClaw *autoclaw.Gateway
+
+	// Failover 跨渠道失败转移配置（见 failover.go）。零值 = 关闭（老行为：
+	// 渠道内轮转失败即透传）。装配期由 cmd/server 用 SetFailover 注入。
+	Failover FailoverConfig
 }
+
+// FailoverConfig 跨渠道失败转移配置（见 failover.go 文件头设计说明）。
+type FailoverConfig struct {
+	// Enabled 总开关。
+	Enabled bool
+	// ChannelFails 单渠道连续失败多少次切下一渠道（>=1）。当前实现里渠道内部
+	// 的换号轮转由各网关自己完成，外层每个渠道只给一次机会，故该值保留供后续
+	// 细粒度策略使用。
+	ChannelFails int
+	// SkipOnCredit 积分耗尽（ErrHardCredit）时停止转移。默认 false = 照常转移
+	// （各渠道额度独立，本渠道没钱不代表别的渠道没钱）。
+	SkipOnCredit bool
+	// MaxChannels 单请求最多尝试渠道数（0 = 全部）。
+	MaxChannels int
+	// Exclude 不参与转移的渠道名（小写，大小写不敏感匹配）。
+	Exclude []string
+}
+
+// SetFailover 装配期注入跨渠道失败转移配置（与 SetGrowthHook 同套路：避免
+// cmd/server 直接改内部字段）。
+func (h *Handler) SetFailover(cfg FailoverConfig) { h.cfg.Failover = cfg }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
 func (h *Handler) loadLive() livecfg.Snapshot {
@@ -240,9 +287,15 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	// 只新增 CN/global 各自可达性供双域部署运维观察（任一域不可用单独告警）。
 	// trae 分档（阶段 2b 合并）：渠道关闭恒 false，不参与主链路判活。
 	realmServable := map[string]bool{
-		"cn":     h.cfg.Pool.ServableForRealm("cn"),
-		"global": h.cfg.Pool.ServableForRealm("global"),
-		"trae":   h.cfg.Trae != nil && h.cfg.Trae.Servable(),
+		"cn":        h.cfg.Pool.ServableForRealm("cn"),
+		"global":    h.cfg.Pool.ServableForRealm("global"),
+		"trae":      h.cfg.Trae != nil && h.cfg.Trae.Servable(),
+		"qoder":     h.cfg.Qoder != nil && h.cfg.Qoder.Servable(),
+		"qoderwork": h.cfg.QoderWork != nil && h.cfg.QoderWork.Servable(),
+		"qwenwork":  h.cfg.QwenWork != nil && h.cfg.QwenWork.Servable(),
+		"codearts":  h.cfg.CodeArts != nil && h.cfg.CodeArts.Servable(),
+		"officeace": h.cfg.OfficeAce != nil && h.cfg.OfficeAce.Servable(),
+		"autoclaw":  h.cfg.AutoClaw != nil && h.cfg.AutoClaw.Servable(),
 	}
 	// 恒无鉴权（负载均衡/编排探活只需 2xx/503 语义），身份靠 service 字段 + X-Service 头双保险。
 	w.Header().Set("X-Service", ServiceName)
@@ -524,6 +577,27 @@ func (h *Handler) modelList() []map[string]any {
 	if h.cfg.Trae != nil && h.cfg.Trae.HasAccounts() {
 		out = append(out, h.cfg.Trae.ModelEntries()...)
 	}
+	// COSY 协议族三渠道名单：同 trae 口径（nil 或无账号不追加，零回归）。
+	if h.cfg.QoderWork != nil && h.cfg.QoderWork.HasAccounts() {
+		out = append(out, h.cfg.QoderWork.ModelEntries()...)
+	}
+	if h.cfg.Qoder != nil && h.cfg.Qoder.HasAccounts() {
+		out = append(out, h.cfg.Qoder.ModelEntries()...)
+	}
+	if h.cfg.QwenWork != nil && h.cfg.QwenWork.HasAccounts() {
+		out = append(out, h.cfg.QwenWork.ModelEntries()...)
+	}
+	// 华为云两渠道名单：同 trae 口径（nil 或无账号不追加，零回归）。
+	if h.cfg.CodeArts != nil && h.cfg.CodeArts.HasAccounts() {
+		out = append(out, h.cfg.CodeArts.ModelEntries()...)
+	}
+	if h.cfg.OfficeAce != nil && h.cfg.OfficeAce.HasAccounts() {
+		out = append(out, h.cfg.OfficeAce.ModelEntries()...)
+	}
+	// AutoClaw 渠道名单：同 trae 口径（nil 或无账号不追加，零回归）。
+	if h.cfg.AutoClaw != nil && h.cfg.AutoClaw.HasAccounts() {
+		out = append(out, h.cfg.AutoClaw.ModelEntries()...)
+	}
 	return out
 }
 
@@ -632,25 +706,44 @@ func (h *Handler) groupLookup(name string) (modelgroup.Group, bool) {
 	return h.cfg.ModelGroups.Lookup(name)
 }
 
-// groupModelPriority 返回组内模型的**生效优先级**顺序。跨渠道主键：「谁先到期
+// groupModelPriority 返回组内模型的**生效优先级**顺序。跨渠道三层规则：
+//
+// 层 1（临期层，最高）：主池或 trae 有 24h 内到期的积分批次 → 维持「谁先到期
 // 用谁」——各条目按所属渠道的最早积分到期时刻升序（workbuddy 取主池健康账号的
 // 最早到期批次；trae 按月度重置日估算，见 Gateway.EarliestCreditExpiry），主池
-// 积分更临期时 cn 条目自然排到 trae 之前，先用掉、好过白白过期。单渠道组内所有
-// 条目共享同一到期时刻，该键恒平局，退化为原有倍率序，行为不变。次键：当前生效
-// 积分倍率升序（限时免费 = 0 排前），倍率相同的保持配置书写顺序；倍率或到期时刻
-// 未知者整体排在已知者之后。默认模型选取与 /models 列表都以此顺序为准。
+// 积分更临期时 cn 条目自然排到 trae 之前，先用掉、好过白白过期。
+// 层 2（COSY 兜底层）：主池与 trae 都无 24h 临期信号 → qoder/qoderwork 条目整体
+// 排到 trae/主池条目之前（COSY 渠道积分无批次概念、不用就留着，先烧它们保住
+// 会过期的）。两渠道都在层内，先后由书写顺序决定（qoder 写前先烧 qoder）。
+// 层 3（回落层）：qoder 与 qoderwork 都不可服务（未配置/无账号/全冷却）时本层
+// 为空，回到层 1 既有规则；层 1/2 内部同等条件下保持配置书写顺序（trae 写前则
+// trae 先用）。
+// 次键：当前生效积分倍率升序（限时免费 = 0 排前），倍率相同的保持配置书写顺序；
+// 倍率或到期时刻未知者整体排在已知者之后。默认模型选取与 /models 列表都以此顺序
+// 为准。
 // 返回元素为剥掉思考强度后缀的条目原文（"cn:glm-5.3-flash|max" → "cn:glm-5.3-
 // flash"，档位由 groupEffortFor 按 bare 反查）；倍率查找同样基于剥离后的名字。
 func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 	if g == nil || len(g.Models) == 0 {
 		return nil
 	}
+	// cosyBoost：层 2 生效条件——qoder/qoderwork 至少一个可服务，且主池/trae 均
+	// 无 24h 临期信号。每 priorities 调用算一次（层键全候选共享，不逐候选判定）。
+	poolSoon := false
+	if h.cfg.Pool != nil {
+		poolSoon = h.cfg.Pool.CountExpiring24h("") > 0
+	}
+	traeSoon := h.cfg.Trae != nil && h.cfg.Trae.HasExpiringWithin(24 * time.Hour)
+	cosyBoost := !poolSoon && !traeSoon &&
+		((h.cfg.Qoder != nil && h.cfg.Qoder.Servable()) ||
+			(h.cfg.QoderWork != nil && h.cfg.QoderWork.Servable()))
 	type cand struct {
 		model  string
 		rate   float64
 		known  bool
 		expiry time.Time // 所属渠道最早积分到期时刻
 		expOK  bool
+		boost  bool // 层 2 qoder 兜底层命中（qoder 条目且 qoderBoost）
 	}
 	// 渠道到期时刻按 realm 缓存：组内同域条目共享一次查询。
 	expCache := map[string]struct {
@@ -700,10 +793,16 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 		cands = append(cands, cand{
 			model: entry, rate: v, known: err == nil,
 			expiry: expiry, expOK: expOK,
+			boost: cosyBoost && (realm == "qoder" || realm == "qoderwork"),
 		})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		a, b := cands[i], cands[j]
+		// 层键：COSY 兜底层（boost=true）恒排在其他渠道之前。cosyBoost=false
+		// 时所有候选 boost 恒 false，本键恒平局，完全退化为下方既有比较。
+		if a.boost != b.boost {
+			return a.boost
+		}
 		// 主键：跨渠道谁先到期用谁。未知（渠道关闭/无到期信号）排已知之后。
 		if a.expOK != b.expOK {
 			return a.expOK
@@ -725,6 +824,45 @@ func (h *Handler) groupModelPriority(g *modelgroup.Group) []string {
 		out[i] = c.model
 	}
 	return out
+}
+
+// cosyChannelChat COSY 协议族三网关的公共对话面（qoder/qoderwork/qwenwork 的
+// Gateway 都实现该签名）。onAccount 上报选号；onOutcome 上报生效 outcome/状态码
+//（reqlog.OutcomeReporter，SSE 已 200 的流内业务错误经它让面板如实显示失败）。
+type cosyChannelChat interface {
+	ChatCompletions(w http.ResponseWriter, r *http.Request, bareModel string,
+		onAccount func(uid, nick string), onOutcome reqlog.OutcomeReporter)
+}
+
+// hwChannel 华为云两渠道（codearts/officeace）公共对话面：Gateway 都实现
+// cosyChannelChat 同款签名。
+func (h *Handler) hwChannel(realm string) (cosyChannelChat, string) {
+	switch realm {
+	case "codearts":
+		if h.cfg.CodeArts == nil {
+			return nil, "codearts"
+		}
+		return h.cfg.CodeArts, "codearts"
+	case "officeace":
+		if h.cfg.OfficeAce == nil {
+			return nil, "officeace"
+		}
+		return h.cfg.OfficeAce, "officeace"
+	}
+	return nil, ""
+}
+
+// cosyChannel 按 realm 返回 COSY 协议族渠道网关（非该族 realm 返回 nil）。
+func (h *Handler) cosyChannel(realm string) (cosyChannelChat, string) {
+	switch realm {
+	case "qoder":
+		return h.cfg.Qoder, "qoder"
+	case "qoderwork":
+		return h.cfg.QoderWork, "qoderwork"
+	case "qwenwork":
+		return h.cfg.QwenWork, "qwenwork"
+	}
+	return nil, ""
 }
 
 // realmServable 报告 workbuddy 池在指定 realm（cn/global）是否还有健康账号。
@@ -759,6 +897,30 @@ func (h *Handler) groupDefaultModel(g *modelgroup.Group) (string, string) {
 		if realm == "trae" {
 			if h.cfg.Trae == nil || !h.cfg.Trae.Servable() {
 				continue
+			}
+			return m, g.EffortOf(bare)
+		}
+		// COSY 协议族条目：同 trae 口径——渠道关闭或无可服务账号时跳过
+		//（cosy 池无主池的模型级冷却语义，不查 ModelBlocked）。
+		switch realm {
+		case "qoder", "qoderwork", "qwenwork":
+			gw, _ := h.cosyChannel(realm)
+			if gw == nil {
+				continue
+			}
+			switch ch := gw.(type) {
+			case *qoder.Gateway:
+				if !ch.Servable() {
+					continue
+				}
+			case *qoderwork.Gateway:
+				if !ch.Servable() {
+					continue
+				}
+			case *qwenwork.Gateway:
+				if !ch.Servable() {
+					continue
+				}
 			}
 			return m, g.EffortOf(bare)
 		}
@@ -898,6 +1060,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 	}
 	defer st.done()
 
+	// 跨渠道失败转移（时点 a）：请求点名了某个渠道，但该渠道整体不可服务
+	//（未启用 / 无可用账号）。此时把请求交给其它已装配渠道，而不是把错误
+	// 直接透传给客户端——点名渠道压根没有可用账号，硬报错等于白白放弃其它渠道。
+	// cn/global 走主链路（下方），不在此列（主链路轮转在函数内部，无法作为
+	// 一个「渠道网关」被调用）。
+	if h.cfg.Failover.Enabled && realm != "cn" && realm != "global" &&
+		!h.servableByName(realm) {
+		if h.failoverDispatch(w, r, body, grp, realm, bareModel, st) {
+			return
+		}
+		// 全部渠道都不可用：落到下面的原路径，报「该渠道未启用」的既有错误。
+	}
 	// trae 渠道分发（阶段 2b 合并）：realm=="trae" 的请求整体移交 trae 子系统
 	//（自含选号/换号/Work 兜底/签到退避）。trae 网关有自己的 "| trae #" 表格日志行，
 	// 外层统计行抑制（st.logged），避免同一请求双行记账。
@@ -920,7 +1094,55 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 		// 面板「请求记录」的账号列才能显示 trae 账号（此前恒为空显示 "—"）。
 		h.cfg.Trae.ChatCompletions(w, r, bareModel, func(uid, nick string) {
 			st.uid, st.nick = uid, nick
-		})
+		}, st.reportOutcome)
+		return
+	}
+	// COSY 协议族三渠道分发：语义同 trae（子网关自含选号/轮转/错误冷却，
+	// st.logged 抑制外层表格行防双行记账；账号经 onAccount 回写请求统计）。
+	if gw, name := h.cosyChannel(realm); gw != nil {
+		st.logged = true
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		gw.ChatCompletions(w, r, bareModel, func(uid, nick string) {
+			st.uid, st.nick = uid, nick
+		}, st.reportOutcome)
+		return
+	} else if realm == "qoder" || realm == "qoderwork" || realm == "qwenwork" {
+		st.status = http.StatusNotFound
+		st.outcome = reqlog.OutcomeHTTPError
+		writeOpenAIError(w, http.StatusNotFound, "unknown_model",
+			name+" channel is disabled (no accounts imported or channel not configured)")
+		return
+	}
+	// 华为云两渠道分发（codearts / officeace）：语义同 trae/COSY——
+	// 子网关自含选号/换号/错误冷却，st.logged 抑制外层表格行。
+	if hw, name := h.hwChannel(realm); hw != nil {
+		st.logged = true
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		hw.ChatCompletions(w, r, bareModel, func(uid, nick string) {
+			st.uid, st.nick = uid, nick
+		}, st.reportOutcome)
+		return
+	} else if realm == "codearts" || realm == "officeace" {
+		st.status = http.StatusNotFound
+		st.outcome = reqlog.OutcomeHTTPError
+		writeOpenAIError(w, http.StatusNotFound, "unknown_model",
+			name+" channel is disabled (no accounts imported or channel not configured)")
+		return
+	}
+	// AutoClaw 渠道分发（autoclaw:）：语义同 trae/COSY——子网关自含选号/换号/
+	// 错误冷却，st.logged 抑制外层表格行。
+	if g := h.cfg.AutoClaw; g != nil && realm == "autoclaw" {
+		st.logged = true
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		g.ChatCompletions(w, r, bareModel, func(uid, nick string) {
+			st.uid, st.nick = uid, nick
+		}, st.reportOutcome)
+		return
+	} else if realm == "autoclaw" {
+		st.status = http.StatusNotFound
+		st.outcome = reqlog.OutcomeHTTPError
+		writeOpenAIError(w, http.StatusNotFound, "unknown_model",
+			"autoclaw channel is disabled (no accounts imported or channel not configured)")
 		return
 	}
 
@@ -1401,7 +1623,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
-			st.outcome = reqlog.OutcomeHTTPError
+			// 口径分流：Aggregate 的读端是 rc（上游流），err 可能只是「客户端已断、
+			// 上游写端随 ctx 取消」的传导结果——那是中断不是上游故障。与流式 sErr
+			// 断连分支、末端出口 ctx canceled 分支同口径记 interrupted，避免面板把
+			// 「客户端 30s 超时自己掐线」统计成 502 http_error 假故障。
+			if r.Context().Err() != nil {
+				st.outcome = reqlog.OutcomeInterrupted
+			} else {
+				st.outcome = reqlog.OutcomeHTTPError
+			}
 			return
 		}
 		// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
@@ -1440,6 +1670,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 		}
 		return
+	}
+	// 跨渠道失败转移（时点 b）：主链路（cn/global）轮转耗尽——换号机会用完，
+	// 但此刻尚未写出任何响应字节，其它渠道可能完全健康。先转移再谈报错。
+	//
+	// 两个不放行的例外（换渠道必然同样失败，转移只是放大请求）：
+	//   - 请求级错误（参数错 / prompt 过长 / 图片无效 / 内容拦截）：错在请求本身；
+	//   - 上游超时：撞的是同一个慢上游，换渠道只会把客户端拖更久（且期间给一串
+	//     健康渠道喂连败计数）。
+	// 积分耗尽（ErrHardCredit）**照常转移**：各渠道额度独立，本渠道没钱不代表
+	// 别的渠道没钱——这正是转移最能救场的场景（除非显式配了 skip_on_credit）。
+	if h.cfg.Failover.Enabled {
+		if !failoverSkip(lastErr, h.cfg.Failover.SkipOnCredit) {
+			if h.failoverDispatch(w, r, body, grp, realm, bareModel, st) {
+				return
+			}
+		}
 	}
 	// 末端错误透传（error-passthrough）：上游返回的错误原样透传，不再规范化成固定文案。
 	// 上游返回（*upstream.Error）→ error.message 装**上游 body 原文**（code/msg/
@@ -1518,7 +1764,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request, groupN
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
-	st.outcome = reqlog.OutcomeHTTPError
+	// 客户端断连（ctx canceled）时轮转必然在这里终止——这不是服务端故障，
+	// outcome 记 interrupted（与流式 sErr 断连分支同口径），别让面板把
+	// 「agent 超时自己掐了连接」的请求统计成 http_error 假 503 故障。
+	if r.Context().Err() != nil {
+		st.outcome = reqlog.OutcomeInterrupted
+	} else {
+		st.outcome = reqlog.OutcomeHTTPError
+	}
 }
 
 // setModelField 强制写入/覆盖请求体的 model 字段。与 rewriteModel（logging.go）

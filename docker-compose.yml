@@ -18,6 +18,9 @@ services:
       # trae 渠道 Web 登录回调（TRAE 登录页重定向到宿主机 127.0.0.1:18080）。
       # 只在面板里做「Web 登录」时需要；不用可删（粘贴回调链接导入不受影响）。
       - "18080:18080"
+      # codearts 渠道 Web 登录回调（portal 重定向到宿主机 127.0.0.1:18081，
+      # 只认 port、路径它固定拼 /oauth/callback）。不用 Web 登录可删。
+      - "18081:18081"
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data

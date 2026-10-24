@@ -13,11 +13,13 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/stagger"
 )
 
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
 // 由签到排程（RunCheckinNow）末尾调用；也可面板手动触发。
 func (s *Scheduler) RunStreakBonusNow() {
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -32,6 +34,12 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a.IsEnterprise() {
 			continue // 企业版门控：无成长体系（/activity/growth/streak 上游一律 403）
 		}
+		// 账号间随机错峰（2026-10-23 事故整改）：放在门控后、首个上游调用前，
+		// 同渠道多账号绝不批量同刻打上游。
+		if !first {
+			time.Sleep(stagger.Heavy())
+		}
+		first = false
 		s.streakBonusAccount(a)
 	}
 }

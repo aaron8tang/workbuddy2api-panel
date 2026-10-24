@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/promptcache"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/upstream"
@@ -26,7 +27,9 @@ import (
 // onAccount 选号上报回调（可 nil）：每次轮转/Work 兜底实际选中账号时以
 // (uid, nickname) 回调，server 侧借此把账号填进面板「请求记录」的账号列
 //（trae 子系统不写 reqlog，直填会 import cycle，经回调解耦）。
-func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareModel string, onAccount func(uid, nick string)) {
+// onOutcome 生效 outcome 上报回调（可 nil）：SSE 已 200 的流内业务错误（空流/
+// 上游业务错帧）经它让面板请求记录如实显示失败，而非按 200 头误记成功。
+func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareModel string, onAccount func(uid, nick string), onOutcome reqlog.OutcomeReporter) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
@@ -48,6 +51,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareMo
 	// 请求级统计：出口打印表格日志
 	st := newChatStat(time.Now(), body, peek.Stream)
 	st.onAccount = onAccount
+	st.onOutcome = onOutcome
 	defer st.done()
 
 	// prompt_cache_key 会话源（P0 费用优化）：promptcache 统一解析链
@@ -215,6 +219,7 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request, bareMo
 				g.cfg.Pool.NoteError(acct.UID, g.cfg.ErrThreshold, g.cfg.ErrCooldown)
 				log.Printf("trae_chat uid=%s: upstream empty stream (no SSE events), head=%.300s", acct.UID, hc.Head())
 				st.status = http.StatusBadGateway
+				st.setOutcome(acct.UID, acct.Nickname, reqlog.OutcomeStreamError, http.StatusBadGateway)
 				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned empty stream")
 				return
 			} else if serr != nil {

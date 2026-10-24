@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/stagger"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -55,59 +56,59 @@ func growthPending(t upstream.Task) bool {
 }
 
 // tasksScanAll 扫描全部账号：成长任务（未完成+可自动化，含 mp 口径合并）。
-// 只读操作，并发拉取（账号数个位数）。
+// 只读操作，串行 + 账号间随机错峰（2026-10-23 事故整改：并发扇出是机器人指纹）。
 func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	states := p.cfg.Pool.List()
 	items := make([]scanAccountItem, len(states))
-	var wg sync.WaitGroup
+	first := true
 	for i, st := range states {
 		if st.Disabled {
 			continue
 		}
-		wg.Add(1)
-		go func(i int, uid string) {
-			defer wg.Done()
-			a := p.cfg.Pool.AuthByUID(uid)
-			if a == nil {
-				return
-			}
-			it := &items[i]
-			it.UID, it.Nickname = uid, a.Nickname
-			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
-			if a.IsGlobal() {
-				return
-			}
-			// 企业版门控：同上——企业版无个人成长体系（GET /v2/activity/growth/tasks
-			// 上游 403「growth system is only available for personal users」）。
-			if a.IsEnterprise() {
-				return
-			}
-			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
-				it.GrowthErr = err.Error()
-			} else {
-				for _, t := range tasks {
-					if growthPending(t) {
-						it.Growth = append(it.Growth, t)
-					}
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		it := &items[i]
+		it.UID, it.Nickname = st.UID, a.Nickname
+		// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
+		if a.IsGlobal() {
+			continue
+		}
+		// 企业版门控：同上——企业版无个人成长体系（GET /v2/activity/growth/tasks
+		// 上游 403「growth system is only available for personal users」）。
+		if a.IsEnterprise() {
+			continue
+		}
+		// 账号间随机错峰（轻查询档）。
+		if !first {
+			time.Sleep(stagger.Light())
+		}
+		first = false
+		if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
+			it.GrowthErr = err.Error()
+		} else {
+			for _, t := range tasks {
+				if growthPending(t) {
+					it.Growth = append(it.Growth, t)
 				}
 			}
-			// 小程序口径任务（school_season 校园日 / Sequential_Tasks_1 小程序首对话）
-			// 仅在 mp 头列表下发，与默认口径不重叠——合并进待办列表；mp 列表失败
-			// 静默（无 mp 任务的部署/活动结束时零影响）。
-			if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
-				seen := map[string]bool{}
-				for _, t := range it.Growth {
-					seen[t.TaskCode] = true
-				}
-				for _, t := range mpTasks {
-					if growthPending(t) && !seen[t.TaskCode] {
-						it.Growth = append(it.Growth, t)
-					}
+		}
+		// 小程序口径任务（school_season 校园日 / Sequential_Tasks_1 小程序首对话）
+		// 仅在 mp 头列表下发，与默认口径不重叠——合并进待办列表；mp 列表失败
+		// 静默（无 mp 任务的部署/活动结束时零影响）。
+		if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
+			seen := map[string]bool{}
+			for _, t := range it.Growth {
+				seen[t.TaskCode] = true
+			}
+			for _, t := range mpTasks {
+				if growthPending(t) && !seen[t.TaskCode] {
+					it.Growth = append(it.Growth, t)
 				}
 			}
-		}(i, st.UID)
+		}
 	}
-	wg.Wait()
 	pending := 0
 	for _, it := range items {
 		pending += len(it.Growth)
@@ -200,12 +201,12 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	q.startedAt = time.Now()
 	q.mu.Unlock()
 
-	// 扫描待办（复用扫描逻辑的拉取部分）。
+	// 扫描待办（复用扫描逻辑的拉取部分）。串行 + 账号间随机错峰
+	//（2026-10-23 事故整改：并发扇出是机器人指纹）。
 	states := p.cfg.Pool.List()
 
 	var accts []queueAccount
-	var wg sync.WaitGroup
-	var mu sync.Mutex
+	first := true
 	for _, st := range states {
 		if st.Disabled {
 			continue
@@ -214,52 +215,50 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 		if a == nil {
 			continue
 		}
-		wg.Add(1)
-		go func(a *auth.Auth) {
-			defer wg.Done()
-			one := queueAccount{a: a}
-			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
-			if a.IsGlobal() {
-				return
-			}
-			// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
-			if a.IsEnterprise() {
-				return
-			}
-			if growth {
-				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
-					for _, t := range tasks {
-						if growthPending(t) {
+		one := queueAccount{a: a}
+		// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
+		if a.IsGlobal() {
+			continue
+		}
+		// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
+		if a.IsEnterprise() {
+			continue
+		}
+		// 账号间随机错峰（轻查询档）。
+		if !first {
+			time.Sleep(stagger.Light())
+		}
+		first = false
+		if growth {
+			if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
+				for _, t := range tasks {
+					if growthPending(t) {
+						one.grow = append(one.grow, t)
+					}
+				}
+				// 合并小程序口径待办（与 tasksScanAll 同口径：mp 列表是默认口径
+				// 超集，按 code 去重；失败静默）。此前此处漏合并——扫描显示
+				// mp 待办而队列报"无可执行待办"。
+				if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
+					seen := map[string]bool{}
+					for _, t := range one.grow {
+						seen[t.TaskCode] = true
+					}
+					for _, t := range mpTasks {
+						if growthPending(t) && !seen[t.TaskCode] {
 							one.grow = append(one.grow, t)
 						}
 					}
-					// 合并小程序口径待办（与 tasksScanAll 同口径：mp 列表是默认口径
-					// 超集，按 code 去重；失败静默）。此前此处漏合并——扫描显示
-					// mp 待办而队列报"无可执行待办"。
-					if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
-						seen := map[string]bool{}
-						for _, t := range one.grow {
-							seen[t.TaskCode] = true
-						}
-						for _, t := range mpTasks {
-							if growthPending(t) && !seen[t.TaskCode] {
-								one.grow = append(one.grow, t)
-							}
-						}
-					}
-					sort.Slice(one.grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
-						return autoActionIndex(one.grow[i].TaskCode) < autoActionIndex(one.grow[j].TaskCode)
-					})
 				}
+				sort.Slice(one.grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
+					return autoActionIndex(one.grow[i].TaskCode) < autoActionIndex(one.grow[j].TaskCode)
+				})
 			}
-			if len(one.grow) > 0 {
-				mu.Lock()
-				accts = append(accts, one)
-				mu.Unlock()
-			}
-		}(a)
+		}
+		if len(one.grow) > 0 {
+			accts = append(accts, one)
+		}
 	}
-	wg.Wait()
 
 	// 组装队列（账号分组，保持顺序）。
 	var items []queueItem
@@ -300,8 +299,9 @@ func (p *Panel) RunGrowthQueueOnce() {
 	}
 }
 
-// runQueueItems 队列执行主体：按账号分组，账号内串行（per-account 锁），
-// 账号间并发（信号量）。每项结果写回队列状态。
+// runQueueItems 队列执行主体：纯串行（2026-10-23 事故整改：同渠道多账号绝不
+// 并发操作，concurrency 参数保留仅为兼容队列状态展示，实际强制 1）。
+// 账号内项间沿用 reportGap 节流，账号间加随机错峰。每项结果写回队列状态。
 func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurrency int) {
 	q := p.queue()
 	defer func() {
@@ -311,50 +311,47 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 		log.Printf("panel: 队列执行结束（共 %d 项）", len(items))
 	}()
 
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
+	first := true
 	for _, one := range accts {
-		wg.Add(1)
-		go func(one queueAccount) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			// per-account 互斥：与单任务/一键完成共用一把锁。
-			if !p.tryLockAccount(one.a.UID) {
-				p.queueSet(q, one.a.UID, func(it *queueItem) {
-					it.Status, it.Message = "skipped", "该账号有其它任务动作在执行，跳过"
-				})
-				return
+		// 账号间随机错峰（重操作档）：任务动作是写操作。
+		if !first {
+			time.Sleep(stagger.Heavy())
+		}
+		first = false
+		// per-account 互斥：与单任务/一键完成共用一把锁。
+		if !p.tryLockAccount(one.a.UID) {
+			p.queueSet(q, one.a.UID, func(it *queueItem) {
+				it.Status, it.Message = "skipped", "该账号有其它任务动作在执行，跳过"
+			})
+			continue
+		}
+		// 前置：批量接受尚未接受的任务。上游对 not_accepted 的任务不计数——
+		// 面板「一键完成」一直有这步，队列路径此前漏了（表现为上报 200 但进度
+		// 一直 not_accepted、无法领奖）。失败不阻塞（行为事件才是进度判据）。
+		if accepted := p.acceptPendingTasks(one.a); accepted > 0 {
+			time.Sleep(reportGap) // 给上游状态流转留时间
+		}
+		for i := range q.items {
+			uid, kind, code := q.snapshotAt(i)
+			if uid != one.a.UID {
+				continue
 			}
-			defer p.unlockAccount(one.a.UID)
-			// 前置：批量接受尚未接受的任务。上游对 not_accepted 的任务不计数——
-			// 面板「一键完成」一直有这步，队列路径此前漏了（表现为上报 200 但进度
-			// 一直 not_accepted、无法领奖）。失败不阻塞（行为事件才是进度判据）。
-			if accepted := p.acceptPendingTasks(one.a); accepted > 0 {
-				time.Sleep(reportGap) // 给上游状态流转留时间
+			p.queueMarkAt(i, "running", "")
+			var msg string
+			var err error
+			switch kind {
+			case "growth":
+				msg, err = p.runGrowthQueued(one.a, code)
 			}
-			for i := range q.items {
-				uid, kind, code := q.snapshotAt(i)
-				if uid != one.a.UID {
-					continue
-				}
-				p.queueMarkAt(i, "running", "")
-				var msg string
-				var err error
-				switch kind {
-				case "growth":
-					msg, err = p.runGrowthQueued(one.a, code)
-				}
-				if err != nil {
-					p.queueMarkAt(i, "error", err.Error())
-				} else {
-					p.queueMarkAt(i, "done", msg)
-				}
-				time.Sleep(reportGap) // 项间节流
+			if err != nil {
+				p.queueMarkAt(i, "error", err.Error())
+			} else {
+				p.queueMarkAt(i, "done", msg)
 			}
-		}(one)
+			time.Sleep(reportGap) // 项间节流
+		}
+		p.unlockAccount(one.a.UID)
 	}
-	wg.Wait()
 }
 
 // queueAccount 队列执行的账号单元（runQueueItems 参数）。
@@ -478,8 +475,9 @@ func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（3 并发，与 packages
-// 同款限流），失败只在对应账号标 error。global 账号无开学季，不发上游调用。
+// schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（串行 + 账号间随机
+// 错峰，2026-10-23 事故整改），失败只在对应账号标 error。global 账号无开学季，
+// 不发上游调用。
 func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 	accts := p.cfg.Pool.List()
 	type row struct {
@@ -488,43 +486,34 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 		Vouchers []upstream.SchoolVoucher `json:"vouchers"`
 		Err      string                   `json:"error,omitempty"`
 	}
-	out := make([]row, len(accts))
-	sem := make(chan struct{}, 3)
-	var wg sync.WaitGroup
-	for i, st := range accts {
+	res := make([]row, 0, len(accts))
+	first := true
+	for _, st := range accts {
 		if st.Disabled {
-			continue // 未占位，行末统一压掉
+			continue
 		}
 		a := p.cfg.Pool.AuthByUID(st.UID)
 		if a == nil {
 			continue
 		}
-		wg.Add(1)
-		go func(i int, a *auth.Auth) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			it := row{UID: a.UID, Nickname: a.Nickname}
-			switch {
-			case a.IsGlobal():
-				it.Err = "global realm（无开学季活动）"
-			default:
-				vs, err := p.cfg.Upstream.SchoolVouchers(a)
-				if err != nil {
-					it.Err = err.Error()
-				} else {
-					it.Vouchers = vs
-				}
+		it := row{UID: a.UID, Nickname: a.Nickname}
+		switch {
+		case a.IsGlobal():
+			it.Err = "global realm（无开学季活动）"
+		default:
+			// 账号间随机错峰（轻查询档）：只对真正发起上游调用的账号计时。
+			if !first {
+				time.Sleep(stagger.Light())
 			}
-			out[i] = it
-		}(i, a)
-	}
-	wg.Wait()
-	res := make([]row, 0, len(out))
-	for _, it := range out {
-		if it.UID != "" {
-			res = append(res, it)
+			first = false
+			vs, err := p.cfg.Upstream.SchoolVouchers(a)
+			if err != nil {
+				it.Err = err.Error()
+			} else {
+				it.Vouchers = vs
+			}
 		}
+		res = append(res, it)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": res})
 }

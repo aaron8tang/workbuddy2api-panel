@@ -72,6 +72,64 @@ func SplitEffort(entry string) (model, effort string) {
 	return entry[:idx], eff
 }
 
+// effortRank 思考强度强弱序（与 upstream.payload 的降级口径同源：值越大思考越强）。
+// off/minimal 一并收录——含 CanDisableThinking 模型的档位表可能给出它们。
+var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
+
+// FitEffort 把配置的思考强度校正到模型实际支持的档位（面板保存时自动更正）：
+//
+//   - supported 为空（未知能力）/ 档位不在已知序（未知词）→ 原样返回（不臆造）
+//   - 档位模型支持 → 原样返回
+//   - 档位高于模型最高档（如 |max 但只支持 low/high）→ 取最高档
+//   - 档位低于模型最低档（如 |low 但只支持 high/xhigh）→ 取最低档
+//   - 档位夹在中间但缺失（如 |medium 但只支持 low/high）→ 取 ≤ 它的最高档（low）
+//
+// 返回 (校正后档位, 是否变更)。大小写/空白不敏感；返回值取 supported 里的原文形态。
+func FitEffort(effort string, supported []string) (string, bool) {
+	want := strings.ToLower(strings.TrimSpace(effort))
+	if want == "" || len(supported) == 0 {
+		return effort, false
+	}
+	reqIdx, known := effortRank[want]
+	if !known {
+		return effort, false // 未知档位词：不臆造，原样保留
+	}
+	// 精确命中（大小写/空白不敏感）→ 保持
+	for _, s := range supported {
+		if strings.ToLower(strings.TrimSpace(s)) == want {
+			return s, false
+		}
+	}
+	// 扫描支持档的 rank 区间
+	bestBelow, bestBelowIdx := "", -1 // ≤ 请求档的最高档
+	lowest, lowestIdx := "", 1 << 30
+	highest, highestIdx := "", -1
+	for _, s := range supported {
+		idx, k := effortRank[strings.ToLower(strings.TrimSpace(s))]
+		if !k {
+			continue
+		}
+		if idx > highestIdx {
+			highest, highestIdx = s, idx
+		}
+		if idx < lowestIdx {
+			lowest, lowestIdx = s, idx
+		}
+		if idx <= reqIdx && idx > bestBelowIdx {
+			bestBelow, bestBelowIdx = s, idx
+		}
+	}
+	switch {
+	case highestIdx >= 0 && reqIdx > highestIdx:
+		return highest, true // 请求过强 → 最高档
+	case bestBelow != "":
+		return bestBelow, true // 降级到 ≤ 请求的最近档
+	case lowest != "":
+		return lowest, true // 请求过弱 → 最低档
+	}
+	return effort, false // 支持表里没有可识别档位 → 不动
+}
+
 // EffortOf 返回 bare（裸模型名）在组内的思考强度配置；未配置或组不限模型返回 ""。
 func (g *Group) EffortOf(bare string) string {
 	for _, m := range g.Models {

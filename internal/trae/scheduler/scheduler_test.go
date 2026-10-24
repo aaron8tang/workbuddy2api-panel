@@ -6,15 +6,23 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/stagger"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/upstream"
 )
+
+// TestMain 关闭账号间错峰等待：单测多账号用例吃不起 3s+ 的真实延迟。
+func TestMain(m *testing.M) {
+	stagger.SetTestFactor(0)
+	os.Exit(m.Run())
+}
 
 // fakeHost 假 upstream 的占位 host：RoundTrip 不真正发网络请求，URL 仅用于路由。
 const fakeHost = "http://fake.trae.test"

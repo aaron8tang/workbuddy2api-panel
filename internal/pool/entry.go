@@ -193,6 +193,12 @@ type entry struct {
 	// creditsExpiring 配置窗口内即将过期的可用积分子集，是 credits 的一部分。
 	// creditsEarliestExpiry / creditsEarliestRemaining 是全部未来到期批次中的最早一批；
 	// 两者均由签到/余额刷新更新，供 earliest-expiry 路由和状态观测使用。
+	// creditFrac 小数扣费累积器（运行态，不持久化）。上游单笔扣费常为 0.2~0.4
+	// credit，而 credits 等聚合字段是整数：按笔四舍五入会把小额扣费吞成 0，本地
+	// 快照永不递减，快过期积分「打空后仍被持续选中」。累积到 ≥1 才按整数扣减，
+	// 权威余额写入点（SetCredits/SetCreditsDetailed/reviveCoolingLocked/
+	// ReenableIfCredits）重置为 0，防止权威刷新后残留双扣。
+	creditFrac                float64
 	creditsExpiring          int64
 	creditsEarliestExpiry    time.Time
 	creditsEarliestRemaining int64

@@ -2,9 +2,10 @@
 
 ## 项目概况
 - Go 语言 AI 网关 + 管理面板：OpenAI 兼容 API（/v1/chat/completions、/v1/models）+ 内嵌 Web 面板（/panel/）。
-- 入口 `cmd/server`，核心包：internal/server（HTTP）、internal/pool（账号池选号）、internal/upstream（上游）、internal/scheduler（定时任务）、internal/panel（面板）、internal/modelgroup（模型组，2026-10-06 新增）、**internal/trae（TRAE SOLO 渠道子系统，2026-10-11 阶段 2b 自 trae2api 彻底合并：根包 gateway/engine/chat/callback/login + auth/ pool/ upstream/ scheduler/ 四子包）**。
-- 监听 :7863，config.json（由 config.example.json 复制，api_key=test_key），凭证落盘 auths/，状态落盘 data/（state.json、usage.json、request-logs/ JSONL 归档）。
-- 版本 appVersion="1.12.0-panel"；路由：/healthz（无可用账号 503）、/panel/、/status、/v1/*；模型组形态 /{组名}/v1（主）+ /v1/{组名}（别名）。
+- 入口 `cmd/server`，核心包：internal/server（HTTP）、internal/pool（账号池选号）、internal/upstream（上游）、internal/scheduler（定时任务）、internal/panel（面板）、internal/modelgroup（模型组，2026-10-06 新增）、**internal/trae（TRAE SOLO 渠道子系统，2026-10-11 阶段 2b 自 trae2api 彻底合并：根包 gateway/engine/chat/callback/login + auth/ pool/ upstream/ scheduler/ 四子包）**、**internal/hwauth（华为云身份底座：DPoP ES256 + CodeArts SDK / OfficeAce SDK+V11 双签名，2026-10-18，金向量测试钉死）**、**internal/codearts + internal/officeace（华为云两渠道，2026-10-18 自 agent2api 移植）**、internal/qoder（qoder.sh 国际）、internal/qoderwork（qoder.com.cn 中国）、internal/qwenwork（千问办公）、internal/cosy（COSY 协议共用底座）。
+- 监听 :7863，config.json（由 config.example.json 复制，api_key=test_key），凭证落盘 auths/，状态落盘 data/（state.json、usage.json、request-logs/ JSONL 归档）。渠道凭证共存：workbuddy*.json / trae-*.json / qoder-*.json / qoderwork-*.json / qwenwork-*.json / **codearts-*.json / officeace-*.json**（glob 前缀互不相交）。
+- 版本 appVersion="1.13.0-panel"；路由：/healthz（无可用账号 503，realm_servable 含 trae/qoder/qoderwork/qwenwork/**codearts/officeace**）、/panel/、/status、/v1/*；模型组形态 /{组名}/v1（主）+ /v1/{组名}（别名）；渠道前缀 8 个：trae:/qoder:/qoderwork:/qwenwork:/**codearts:/officeace:**。
+- **渠道接线清单（加新渠道照此）**：resolve_model 枚举 → handler.Config 字段+hwChannel/cosyChannel 分发+healthz+models → config.go 渠道段+normalize → main.go 装配+panel/server 传门面+restartRequiredFields → panel.Config 字段+路由文件 → index.html box+app.js（COSY_CHANNELS/登录轮询/渲染）。门面 nil=渠道完全关闭（零回归）。
 
 ## 开发环境约定
 - Go 1.27.1 安装在 d:\devhome\Go\，编译前 `set PATH=D:\devhome\Go\bin;%PATH%`。
@@ -71,6 +72,14 @@
 **4028 修复（fix4028）**：WorkBuddy CLI 出站带 `destination-addr: 127.0.0.1:7863`，上游 loopback 校验必 4028。upstream payload.go denylist 剥离，日志 `[payload] stripped client-private field "destination-addr" from body`。
 
 **fixA（粘性移除）**：prompt_cache_key 统一后 SOLO/CN 两池及池内账号完全不需要粘性，选号全部走临期优先加权轮换（24h 临期权重）。
+
+## 风控铁律：同渠道多账号绝不并发（2026-10-24 整改定型）
+- **2026-10-23 22:00:01 事故**：keepalive 串行但零延迟，5 个 CN 账号 token 刷新落同一秒，上游批量吊销全部会话（12153 invalid_grant）。用户定性：这是机器人指纹，同渠道多账号**绝对不能同时并发操作**。
+- **整改（全部批量点已落地）**：新建共享包 `internal/stagger`——`Heavy()`=3s+rand(0~5s)（签到/保活/刷新/任务写操作）、`Light()`=1s+rand(0~2s)（余额/积分包/扫描/昵称/券码），`SetTestFactor(0)` 测试置零（两个 scheduler 包 TestMain）。**first 范式**：`first := true` → 所有 continue 门控后、首个上游调用前 → `if !first { time.Sleep(stagger.X()) }; first = false`。
+- 覆盖：主池 scheduler 5 处（checkin/keepalive/balance串行/pkgrefresh串行/streak）、trae scheduler 4 函数、4 渠道 CheckinAll（qoderwork/autoclaw/codearts/officeace）、panel 6 处扇出（syncNicknames/packages/tasksScanAll/startGrowthQueue 扫描/runQueueItems 纯串行/schoolVouchers）。详见 memory/2026-10-24.md。
+- **加新批量任务点必须照 first 范式加错峰**；固定间隔也是指纹，必须随机。
+- **第二阶段（同日）：批量互斥 + 触发抖动**——① 全局批量闸门 `batchMu` TryLock（两个 scheduler 包 + 4 渠道 `checkinMu` 分层互斥），手动×定时×连点×ticker 全互斥，忙时拒绝（panel balanceAll 忙时 409）；**拆分范式 `RunXxxNow()`=闸门包装+`doXxx()` 本体，持锁内直调 do\* 避免嵌套 TryLock 全跳过**（RunStreakBonusNow 因链式调用无闸门）；② runBatch 并行改串行；③ `stagger.FireJitter()` 0~5min 定时触发抖动（抹「准点整点批量」指纹，仅定时入口、手动不走）。详见 memory/2026-10-24.md 第二阶段。
+- **第三阶段（同日）：主池外渠道全量核查**——逐个渠道读源码验证，补两处漏网：① autoclaw `StartHourlyRefresh` 每小时 `force=true` 零延迟刷全部账号（最严重，同 10-23 事故形态）→ 抽 `refreshAllHourly()`，`checkinMu` 互斥 + FireJitter + 账号间 Heavy；② officeace `StartRefresher` 10min 零延迟扫临期号且全仓无调用点（死代码）→ 直接删除（CheckinAll/转发链已有 `ensureControlPlane` 兜底）。**新增后台批量循环必须同时接渠道 checkinMu + FireJitter + Heavy，三者缺一不可。**
 
 ## 上下文压缩责任边界（2026-10-13 定论，排障必读）
 **cn:step-5-preview 190K tokens 触发压缩是 WorkBuddy 客户端自己的行为，与网关/上游无关。**

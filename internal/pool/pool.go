@@ -60,6 +60,10 @@ type Pool struct {
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
 	preferExpiring bool
+	// expiringSoonDur 快过期窗口（expiring_soon，与 scheduler 路由快照窗口同源注入）。
+	// expiringNow 的包明细（pkgs）信号按此窗口判定到期时刻；0 = pkgs 信号关闭
+	// （仅聚合快照信号生效，缺省即旧行为）。运行态字段，由 main 注入并热更新。
+	expiringSoonDur time.Duration
 	// accountOrder / accountOrderRank 手工使用顺序（SetAccountOrder 注入；面板账号池
 	// ↑↓ 维护，config pool.account_order 持久化）。非空时 pick() 在最终候选内按名次
 	// 取第一个可用者（顺序即使用优先级，覆盖加权随机）；nil = 自动模式。
@@ -197,6 +201,15 @@ func (p *Pool) SetPreferExpiring(enabled bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.preferExpiring = enabled
+}
+
+// SetExpiringSoonWindow 注入快过期窗口（main 从 config 解析后调用，与
+// scheduler.SetExpiringSoonWindow 同源同值）。窗口影响 expiringNow 的包明细
+// （pkgs）信号判定；聚合快照信号由下一次签到/余额刷新按新窗口重建，无需清理。
+func (p *Pool) SetExpiringSoonWindow(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.expiringSoonDur = d
 }
 
 // SetAccountOrder 注入手工使用顺序（面板账号池 ↑↓ 维护，main 从 config 解析后调用；

@@ -14,6 +14,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/stagger"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -61,6 +62,23 @@ type Config struct {
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
 	GrowthHook func()
+
+	// 渠道签到钩子（ChannelCheckinHooks）：主账号池之外的渠道（trae/qoderwork/
+	// codearts/officeace/autoclaw）在签到时点一并执行各自的每日动作。
+	//
+	// 为什么是"钩子表 + func() []string"而不是直接持有各渠道网关类型：
+	// scheduler 不 import 任何渠道包（渠道包不 import scheduler，但 panel 同时
+	// import 两者），直接持有具体类型会把依赖方向钉死；钩子由 main 在各网关构造
+	// 完成后挂载（网关 nil = 渠道关闭 = nil 钩子 = 到点跳过）。返回值是结果摘要
+	// 行（每条一行，进运行日志），便于统一呈现。
+	ChannelCheckinHooks []ChannelCheckinHook
+}
+
+// ChannelCheckinHook 一个渠道的签到钩子：Name 用于日志标识，Run 执行并返回
+// 结果摘要行（每行一条，进运行日志）。
+type ChannelCheckinHook struct {
+	Name string
+	Run  func() []string
 }
 
 // Scheduler 调度器。
@@ -82,6 +100,14 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// batchMu 全局批量闸门：同一时刻只允许一个「遍历全部账号」的批量任务在跑
+	// （签到/旅行/活跃/保活/余额/积分包，无论手动按钮、定时槽还是后台 ticker 触发）。
+	// 防的是交叉并发：手动×定时、连点、同槽多族、余额 ticker 撞上签到等——
+	// 账号间错峰只保证单批内部有序，两批交叉仍会同秒打同一账号。
+	// 忙时 TryLock 失败直接拒绝：定时任务下轮再跑，余额/积分包晚一个周期无影响，
+	// 手动点击收到「执行中」日志。零值可用（测试直接字面构造 Scheduler）。
+	batchMu sync.Mutex
 }
 
 // New 构建。
@@ -138,6 +164,15 @@ func (s *Scheduler) SetExpiringSoonWindow(d time.Duration) {
 func (s *Scheduler) SetGrowthHook(fn func()) {
 	s.schedMu.Lock()
 	s.cfg.GrowthHook = fn
+	s.schedMu.Unlock()
+}
+
+// SetChannelCheckinHooks 挂载渠道签到钩子表（main 在各渠道网关构造完成后调用；
+// nil 或空表 = 只有主账号池参与签到）。钩子是装配期对象，改动需重启进程
+//（与 trae/COSY/华为云/AutoClaw 渠道同口径，见 restartRequiredFields）。
+func (s *Scheduler) SetChannelCheckinHooks(hooks []ChannelCheckinHook) {
+	s.schedMu.Lock()
+	s.cfg.ChannelCheckinHooks = hooks
 	s.schedMu.Unlock()
 }
 
@@ -383,46 +418,52 @@ func (s *Scheduler) Run(ctx context.Context) {
 			if !awaitWakeupGrace(ctx, next) {
 				return // ctx 取消：放弃本批，优雅退出
 			}
-			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
-			// 多号 × 间隔 ≈ 数分钟睡眠）不再阻塞同槽其他任务族；返回前等全部
-			// 任务收尾（下一轮 nextWake 照旧从"现在"起算，多轮重叠的风险与
-			// 串行版相同——nextWake 只挑现在之后的时点）。
-			s.runBatch(ctx, kinds)
+			// 触发抖动（风控）：整点准点发起批量请求是机器人指纹（2026-10-23
+			// 事故整改第二阶段），到点后随机延迟 0~5min 再跑。只挂在定时分支，
+			// 手动入口不抖（用户点了就该立刻动）；迟到补跑同样抖（上游看不出
+			// 这是补跑）。测试 factor=0 时 FireJitter 返回 0。
+			if !sleepCtx(ctx, stagger.FireJitter()) {
+				return // ctx 取消：放弃本批，优雅退出
+			}
+			// 串行执行本批全部任务族：各族依次跑完，跨族访问同账号有确定性
+			// 间隔；族间不复用 waitGroup 并行（并行族之间没有账号间错峰保护，
+			// 且闸门忙时会拒绝整族导致任务丢失）。闸门保证手动×定时×ticker
+			// 全局互斥：拿不到说明已有别的批量在跑，本轮放弃，下轮再算。
+			if s.tryAcquireBatch("定时批量") {
+				s.runBatch(ctx, kinds)
+				s.batchMu.Unlock()
+			}
 		}
 	}
 }
 
-// runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
+// runBatch 串行执行一批任务（同一唤醒时刻的多类任务）：调用方已持有 batchMu
+// 闸门，这里直接直调各族实现（do*）。串行而非并行——并行族之间没有账号间错峰
+// 保护，同一秒两族各打同一账号与单族内同秒等价；串行让跨族访问天然错开。
 // ctx 取消时由各任务内部的可取消等待快速收尾。
 func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
-	var wg sync.WaitGroup
 	for _, k := range kinds {
-		wg.Add(1)
-		go func(k taskKind) {
-			defer wg.Done()
-			switch k {
-			case taskCheckin:
-				s.RunCheckinNow()
-			case taskTravel:
-				s.RunTravelNow()
-			case taskActivity:
-				s.runActivity(ctx)
-			case taskKeepalive:
-				s.RunKeepaliveNow()
-			case taskBlackcat:
-				s.RunBlackcatNow()
-			case taskGrowth:
-				// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
-				s.schedMu.Lock()
-				hook := s.cfg.GrowthHook
-				s.schedMu.Unlock()
-				if hook != nil {
-					hook()
-				}
+		switch k {
+		case taskCheckin:
+			s.doCheckin()
+		case taskTravel:
+			s.doTravel()
+		case taskActivity:
+			s.runActivity(ctx)
+		case taskKeepalive:
+			s.doKeepalive()
+		case taskBlackcat:
+			s.RunBlackcatNow()
+		case taskGrowth:
+			// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
+			s.schedMu.Lock()
+			hook := s.cfg.GrowthHook
+			s.schedMu.Unlock()
+			if hook != nil {
+				hook()
 			}
-		}(k)
+		}
 	}
-	wg.Wait()
 }
 
 // sleepCtx 可取消的等待：ctx 取消立即返回 false（优雅停机不必等限速睡醒），
@@ -441,15 +482,38 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
+// tryAcquireBatch 全局批量闸门：拿到即独占批量执行权（调用方负责 Unlock），
+// 拿不到返回 false 并落一行拒绝日志（定时任务下轮再跑；手动入口由调用方提示忙）。
+func (s *Scheduler) tryAcquireBatch(who string) bool {
+	if s.batchMu.TryLock() {
+		return true
+	}
+	log.Printf("scheduler: 批量任务执行中，%s 本轮跳过（闸门互斥）", who)
+	return false
+}
+
+// RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻（面板手动入口）。
+// 全局批量闸门：其他批量任务（定时族/余额 ticker/连点）执行中时直接拒绝，
+// 防两批交叉同秒打同一账号（2026-10-23 事故整改第二阶段）。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用账号默认跳过——
 // 若 schedule.include_disabled_in_tasks 打开则一并执行（禁用只关选号，不停保号）。
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
+	if !s.tryAcquireBatch("手动签到") {
+		return
+	}
+	defer s.batchMu.Unlock()
+	s.doCheckin()
+}
+
+// doCheckin 签到遍历本体（调用方必须已持有 batchMu）：定时槽走 runBatch→本函数，
+// 手动走 RunCheckinNow 包装；链式收尾连登管家与渠道签到同锁内执行。
+func (s *Scheduler) doCheckin() {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -464,6 +528,13 @@ func (s *Scheduler) RunCheckinNow() {
 		if a.IsGlobal() {
 			continue
 		}
+		// 账号间随机错峰：同渠道多账号绝不批量同刻打上游（2026-10-23 22:00
+		// keepalive 同秒刷新 5 个账号的事故整改）。放在门控后、首个上游调用前，
+		// 企业号（跳签到但仍查余额）同样错峰。
+		if !first {
+			time.Sleep(stagger.Heavy())
+		}
+		first = false
 		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
 		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
 		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
@@ -495,9 +566,47 @@ func (s *Scheduler) RunCheckinNow() {
 		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 	}
 	s.RunStreakBonusNow()
+	// 渠道签到：主池之外的渠道在同一时点执行各自每日动作（钩子由 main 装配时
+	// 挂载，网关 nil = 渠道关闭 = 无钩子）。每个渠道独立 recover——一个渠道
+	// panic 不能带走整轮签到（渠道包是后集成的，健壮性参差）。
+	// 注意：这里仍在 batchMu 闸门内——渠道 CheckinAll 自带各自的渠道级互斥，
+	// 与本闸门分层（主池批量 vs 渠道批量），不冲突。
+	s.runChannelCheckins()
 }
 
-// RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
+// runChannelCheckins 逐个跑渠道签到钩子，把结果摘要写进运行日志。
+func (s *Scheduler) runChannelCheckins() {
+	s.schedMu.Lock()
+	hooks := s.cfg.ChannelCheckinHooks
+	s.schedMu.Unlock()
+	for _, h := range hooks {
+		if h.Run == nil {
+			continue
+		}
+		name := h.Name
+		if name == "" {
+			name = "channel"
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("checkin %s: panic: %v", name, r)
+				}
+			}()
+			lines := h.Run()
+			if len(lines) == 0 {
+				log.Printf("checkin %s: 无账号或无结果", name)
+				return
+			}
+			for _, line := range lines {
+				log.Printf("checkin %s: %s", name, line)
+			}
+		}()
+	}
+}
+
+// RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报（面板手动入口，
+// 全局批量闸门互斥，忙时拒绝）。
 // 禁用账号默认跳过（schedule.include_disabled_in_tasks 打开时一并上报）；
 // 无 AccessToken 的跳过；账号间限速 activityAccountDelay。
 // CN 与 global 账号**都上报**（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上
@@ -507,6 +616,10 @@ func (s *Scheduler) RunCheckinNow() {
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
 // runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
 func (s *Scheduler) RunActivityNow() {
+	if !s.tryAcquireBatch("手动活跃上报") {
+		return
+	}
+	defer s.batchMu.Unlock()
 	s.runActivity(context.Background())
 }
 
@@ -570,15 +683,26 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 	return false
 }
 
-// RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。
-// 禁用账号默认跳过；若 schedule.include_disabled_in_tasks 打开，禁用号也会续期 token
+// RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用（面板手动入口，
+// 全局批量闸门互斥，忙时拒绝）。禁用账号默认跳过；若 schedule.include_disabled_in_tasks
+// 打开，禁用号也会续期 token
 // （这是轮换用法下把闲置号保持可用的关键），但**不再对已禁用的号重复计数 12153**——
 // 它已经是终态，再计一次只会打出一行「— 禁用」的误导日志。
 // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	if !s.tryAcquireBatch("手动保活") {
+		return
+	}
+	defer s.batchMu.Unlock()
+	s.doKeepalive()
+}
+
+// doKeepalive 保活遍历本体（调用方必须已持有 batchMu）。
+func (s *Scheduler) doKeepalive() {
 	includeDisabled := s.includeDisabledInTasks()
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -587,6 +711,12 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
+		// 账号间随机错峰：2026-10-23 22:00:01 同秒例行刷新 5 个账号——串行但
+		// 零延迟在快上游下就是同一秒，是典型机器人特征。改为 3~8s 随机间隔。
+		if !first {
+			time.Sleep(stagger.Heavy())
+		}
+		first = false
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
@@ -604,17 +734,31 @@ func (s *Scheduler) RunKeepaliveNow() {
 	}
 }
 
-// RunBalanceRefreshNow 并发查询余额并更新池内 credits。
-// 账号范围：默认跳过禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
+// RunBalanceRefreshNow 串行查询余额并更新池内 credits（账号间随机错峰）。
+// 全局批量闸门互斥：余额 ticker / 面板手动刷新 / 其他批量任务三方互斥，
+// 忙时拒绝并返回 false（面板据此回 409「执行中」；ticker 侧晚一周期无影响）。
+// 并发扇出是 2026-10-23 会话批量吊销事故的头号风险点——同渠道多账号同一窗口
+// 打同一接口是典型机器人特征，改为串行 + Light 档错峰。账号范围：默认跳过
+// 禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
 // （轮换用法下据此判断下一个该启用谁）。注意 ReenableIfCredits 对 disabled 是
 // no-op，所以本开关**不会**导致禁用号被自动解冻——它只让已有账号的积分保持新鲜。
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
-func (s *Scheduler) RunBalanceRefreshNow() {
-	var wg sync.WaitGroup
+func (s *Scheduler) RunBalanceRefreshNow() bool {
+	if !s.tryAcquireBatch("余额刷新") {
+		return false
+	}
+	defer s.batchMu.Unlock()
+	s.doBalanceRefresh()
+	return true
+}
+
+// doBalanceRefresh 余额刷新遍历本体（调用方必须已持有 batchMu）。
+func (s *Scheduler) doBalanceRefresh() {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -623,19 +767,18 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		if a == nil {
 			continue
 		}
-		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
-			defer wg.Done()
-			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
-			if err != nil {
-				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
-				return
-			}
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-		}(a, st.UID)
+		if !first {
+			time.Sleep(stagger.Light())
+		}
+		first = false
+		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
+		if err != nil {
+			log.Printf("balance %s: %v", logfmt.Label(st.UID, a.Nickname), err)
+			continue
+		}
+		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
+		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 	}
-	wg.Wait()
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
@@ -687,15 +830,26 @@ func (s *Scheduler) SetBalanceInterval(d time.Duration) {
 	poke(s.rearmBalance)
 }
 
-// RunPackageRefreshNow 并发拉取全部账号的积分包明细并写入池内本地快照
-// （pool.SetCreditPackages）。账号范围口径同 RunBalanceRefreshNow：默认跳过
-// 禁用账号；include_disabled_in_tasks 打开时一并刷新。失败账号保留旧快照
-// （SetCreditPackages 仅成功路径调用），下次每日刷新再补。
-// 供每日定时任务（StartPackageRefresh）与启动预热调用；面板「积分构成」的
-// 实时查询走 panel.packages()（现打上游），两者不共用。
+// RunPackageRefreshNow 串行拉取全部账号的积分包明细并写入池内本地快照
+// （pool.SetCreditPackages），账号间随机错峰（同 doBalanceRefresh：
+// goroutine 并发扇出已废，同渠道多账号绝不并发打上游）。全局批量闸门互斥，
+// 忙时拒绝（每日任务晚点再跑无影响）。账号范围口径同
+// RunBalanceRefreshNow：默认跳过禁用账号；include_disabled_in_tasks 打开时
+// 一并刷新。失败账号保留旧快照（SetCreditPackages 仅成功路径调用），下次
+// 每日刷新再补。供每日定时任务（StartPackageRefresh）与启动预热调用；
+// 面板「积分构成」的实时查询走 panel.packages()（现打上游），两者不共用。
 func (s *Scheduler) RunPackageRefreshNow() {
-	var wg sync.WaitGroup
+	if !s.tryAcquireBatch("积分包刷新") {
+		return
+	}
+	defer s.batchMu.Unlock()
+	s.doPackageRefresh()
+}
+
+// doPackageRefresh 积分包刷新遍历本体（调用方必须已持有 batchMu）。
+func (s *Scheduler) doPackageRefresh() {
 	includeDisabled := s.includeDisabledInTasks()
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -704,38 +858,37 @@ func (s *Scheduler) RunPackageRefreshNow() {
 		if a == nil {
 			continue
 		}
-		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
-			defer wg.Done()
-			packs, _, _, err := s.cfg.Upstream.CreditPackages(a)
-			if err != nil {
-				log.Printf("pkgrefresh %s: %v", logfmt.Label(uid, a.Nickname), err)
-				return
-			}
-			pkgs := make([]pool.PkgSnapshot, 0, len(packs))
-			for _, cp := range packs {
-				// 失效时刻：ExpiresAt（Unix 毫秒，DeductionEndTime 优先口径）权威；
-				// 0 时回退解析 EndTime（上游墙钟 "2006-01-02 15:04:05"，UTC+8；
-				// RFC3339 形态经 time.Parse 自然兜底）。两者皆缺的包不计入快照。
-				var exp time.Time
-				if cp.ExpiresAt > 0 {
-					exp = time.UnixMilli(cp.ExpiresAt)
-				} else if cp.EndTime != "" {
-					if t, perr := time.ParseInLocation("2006-01-02 15:04:05", cp.EndTime, time.FixedZone("UTC+8", 8*60*60)); perr == nil {
-						exp = t
-					} else if t, perr := time.Parse(time.RFC3339, cp.EndTime); perr == nil {
-						exp = t
-					}
+		if !first {
+			time.Sleep(stagger.Light())
+		}
+		first = false
+		packs, _, _, err := s.cfg.Upstream.CreditPackages(a)
+		if err != nil {
+			log.Printf("pkgrefresh %s: %v", logfmt.Label(st.UID, a.Nickname), err)
+			continue
+		}
+		pkgs := make([]pool.PkgSnapshot, 0, len(packs))
+		for _, cp := range packs {
+			// 失效时刻：ExpiresAt（Unix 毫秒，DeductionEndTime 优先口径）权威；
+			// 0 时回退解析 EndTime（上游墙钟 "2006-01-02 15:04:05"，UTC+8；
+			// RFC3339 形态经 time.Parse 自然兜底）。两者皆缺的包不计入快照。
+			var exp time.Time
+			if cp.ExpiresAt > 0 {
+				exp = time.UnixMilli(cp.ExpiresAt)
+			} else if cp.EndTime != "" {
+				if t, perr := time.ParseInLocation("2006-01-02 15:04:05", cp.EndTime, time.FixedZone("UTC+8", 8*60*60)); perr == nil {
+					exp = t
+				} else if t, perr := time.Parse(time.RFC3339, cp.EndTime); perr == nil {
+					exp = t
 				}
-				if exp.IsZero() {
-					continue
-				}
-				pkgs = append(pkgs, pool.PkgSnapshot{Remain: cp.Remain, ExpireAt: exp})
 			}
-			s.cfg.Pool.SetCreditPackages(uid, pkgs)
-		}(a, st.UID)
+			if exp.IsZero() {
+				continue
+			}
+			pkgs = append(pkgs, pool.PkgSnapshot{Remain: cp.Remain, ExpireAt: exp})
+		}
+		s.cfg.Pool.SetCreditPackages(st.UID, pkgs)
 	}
-	wg.Wait()
 }
 
 // StartPackageRefresh 每日积分包明细刷新（独立 ticker goroutine，ctx 取消即停）。

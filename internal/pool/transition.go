@@ -87,6 +87,7 @@ func (p *Pool) resumeLocked(e *entry) {
 // billing 通道健康，不证明 chat 通道健康。调用方必须已持有 p.mu。
 func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
 	e.credits = credits
+	e.creditFrac = 0 // 权威余额写入：清小数累积器，防残留双扣
 	e.creditsTotal = total
 	if e.coolKind == CoolHard {
 		e.until = time.Time{}

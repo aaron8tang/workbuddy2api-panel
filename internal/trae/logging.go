@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 )
 
 // chatSeq 进程级请求序号。
@@ -34,6 +35,9 @@ type chatStat struct {
 	// onAccount 选号上报回调（server 分发时注入）：trae 子系统不写 reqlog，
 	// 面板「请求记录」的账号列由 server 侧 chatStat 填充，经此回调免 import cycle。
 	onAccount func(uid, nick string)
+	// onOutcome 生效 outcome 上报回调（server 分发时注入，reqlog.OutcomeReporter）：
+	// SSE 已 200 的流内业务错误（空流/上游错帧）经它覆写面板 outcome/状态码。
+	onOutcome reqlog.OutcomeReporter
 	logged    bool
 }
 
@@ -44,6 +48,20 @@ func (s *chatStat) setAccount(uid, nick string) {
 	s.uid, s.nick = uid, nick
 	if s.onAccount != nil {
 		s.onAccount(uid, nick)
+	}
+}
+
+// setOutcome 生效 outcome 上报（reqlog.OutcomeReporter 形状）：SSE 已 200 的流内
+// 业务错误由网关在收尾时调用，覆写面板展示的状态码与 outcome（后到为准）。
+func (s *chatStat) setOutcome(uid, nick, outcome string, httpStatus int) {
+	if uid != "" {
+		s.uid, s.nick = uid, nick
+	}
+	if httpStatus > 0 {
+		s.status = httpStatus
+	}
+	if s.onOutcome != nil {
+		s.onOutcome("", "", outcome, httpStatus)
 	}
 }
 
@@ -193,6 +211,12 @@ func parseModelFromBody(body []byte) string {
 // soloKnownFields 诊断白名单：与 upstream.soloAllowedFields 同口径（SOLO 协议
 // 字段 + OpenAI 常规采样参数 + 服务端注入的 reasoning_effort）。此外的字段
 // 视为调用方私有字段，logUnexpectedFields 会打日志观测。
+//
+// 注意 stream_options：OpenAI 流式用量开关（AsyncOpenAI / WorkBuddy CLI 每个流式
+// 请求都带 {"include_usage":true}）。SOLO 上游 struct 不认它，出站白名单
+//（payload.go soloAllowedFields）会剔除——上游永远看不到。诊断白名单放行它，
+// 避免每个请求刷一条 "unexpected body field" 噪音（实测 WorkBuddy CLI 会话
+// 每分钟十几条）。
 var soloKnownFields = map[string]bool{
 	"messages": true, "stream": true, "function": true, "config_name": true,
 	"model": true, "tools": true, "tool_choice": true,
@@ -200,6 +224,7 @@ var soloKnownFields = map[string]bool{
 	"frequency_penalty": true, "presence_penalty": true,
 	"stop": true, "seed": true, "reasoning_effort": true,
 	"reasoning": true, "thinking": true,
+	"stream_options": true,
 }
 
 // logRequestBodyProfile 打印一行请求体画像（定位上游 3004 类拒绝由何种请求

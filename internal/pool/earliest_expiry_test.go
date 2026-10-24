@@ -66,3 +66,37 @@ func TestEarliestCreditExpiry(t *testing.T) {
 		t.Fatal("无未来到期批次时应返回 ok=false")
 	}
 }
+
+// TestEarliestCreditExpiryPkgsSignal 包明细信号（回归 2026-10-18 实案）：聚合快照
+// 三字段全缺（balance 刷新被 billing 域 WAF 401 拦截的持续形态）但 pkgs 明细里
+// 有 24h 内到期批次时，跨渠道「谁先到期用谁」必须照样生效——明细是独立于余额
+// 刷新的数据源（每日拉取 + 每调用 FEFO 实时扣减），billing 域被拦不能让 CN 信号
+// 恒 ok=false 而被 trae 渠道压过。
+func TestEarliestCreditExpiryPkgsSignal(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn-pkgs"})
+	// 关键场景：SetCreditsDetailed 从未写入 earliest（零值），只有 pkgs 明细。
+	soon := time.Now().Add(3 * time.Hour).Truncate(time.Second)
+	p.SetCreditPackages("cn-pkgs", []PkgSnapshot{{Remain: 500, ExpireAt: soon}})
+
+	got, ok := p.EarliestCreditExpiry("cn")
+	if !ok || !got.Equal(soon) {
+		t.Fatalf("pkgs-only signal: cn = %v ok=%v, want %v ok=true", got, ok, soon)
+	}
+
+	// 明细里的包全部过期（快照未刷新残留）→ 回落聚合快照（同样缺失）→ ok=false。
+	p.SetCreditPackages("cn-pkgs", []PkgSnapshot{{Remain: 500, ExpireAt: time.Now().Add(-time.Hour)}})
+	if _, ok := p.EarliestCreditExpiry("cn"); ok {
+		t.Fatal("过期明细包不应产生信号")
+	}
+
+	// 明细与聚合快照并存时明细优先（NoteModelCost 实时扣减精度更高）。
+	agg := time.Now().Add(10 * time.Hour).Truncate(time.Second)
+	p.SetCreditPackages("cn-pkgs", []PkgSnapshot{{Remain: 100, ExpireAt: soon}})
+	p.SetCreditsDetailed("cn-pkgs", 1000, 0, 0, agg, 500)
+	got, ok = p.EarliestCreditExpiry("cn")
+	if !ok || !got.Equal(soon) {
+		t.Fatalf("pkgs should outrank aggregate snapshot: cn = %v ok=%v, want %v", got, ok, soon)
+	}
+}

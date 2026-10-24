@@ -45,6 +45,15 @@ const (
 	OutcomeInterrupted = "interrupted"
 )
 
+// OutcomeReporter 子网关（trae/cosy 系）向 server 侧请求统计回传**生效 outcome**
+// 的回调类型（server → 网关注入，网关在流内错误等 SSE 已 200 无法由状态码表达
+// 的场景调用）。reqlog 是叶子包，各方引用它不会引入 import cycle。
+//   - uid/nick：实际服务（或最后尝试）的账号——语义与既有 onAccount 一致；
+//   - outcome：Outcome* 常量之一（流内业务错误建议 stream_error，Busy 类同）；
+//   - httpStatus：语义状态码（面板「状态」列展示用；SSE 已 200 时可传真实
+//     业务码如 502/429，仅影响展示，不改响应）。
+type OutcomeReporter func(uid, nick, outcome string, httpStatus int)
+
 // Config 归档参数。Enabled=false 时仍保留内存指标。
 type Config struct {
 	Dir           string

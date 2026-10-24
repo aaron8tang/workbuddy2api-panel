@@ -15,6 +15,7 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
 		e.creditsTotal = total
+		e.creditFrac = 0 // 权威余额写入：清小数累积器，防残留双扣
 		p.dirty.Store(true)
 	}
 }
@@ -91,6 +92,7 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, ea
 			earliestRemaining = 0
 		}
 		e.credits = credits
+		e.creditFrac = 0 // 权威余额写入：清小数累积器，防残留双扣
 		e.creditsTotal = total
 		e.creditsExpiring = expiring
 		e.creditsEarliestExpiry = earliestAt
@@ -100,10 +102,16 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, ea
 }
 
 // EarliestCreditExpiry 返回指定 realm（cn/global）健康账号中最早的积分到期批次
-// 时刻。口径：healthy（非禁用/暂停/冷却）且存在未来到期批次
-// （creditsEarliestRemaining>0、到期时刻在未来）。供模型组 default 的跨渠道
-// 「谁先到期用谁」排序使用；realm 内无有效信号返回 ok=false（调用方按未知处理，
-// 未知排已知之后）。
+// 时刻。口径：healthy（非禁用/暂停/冷却）且存在未来到期批次。数据源与 expiringNow
+// 同纪律取并集：
+//   - pkgs 包明细（每日拉取 SetCreditPackages 写入，NoteModelCost 每调用 FEFO
+//     实时扣减）——不依赖余额刷新，billing 域被 WAF 拦（401 刷屏实案）时本信号
+//     依然存活；
+//   - 聚合快照 creditsEarliestExpiry/creditsEarliestRemaining（余额刷新/签到写入），
+//     明细缺失（上游未回批次）时兜底。
+//
+// 供模型组 default 的跨渠道「谁先到期用谁」排序使用；realm 内无有效信号返回
+// ok=false（调用方按未知处理，未知排已知之后）。
 func (p *Pool) EarliestCreditExpiry(realm string) (time.Time, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -115,6 +123,13 @@ func (p *Pool) EarliestCreditExpiry(realm string) (time.Time, bool) {
 		}
 		if !e.healthy(now) {
 			continue
+		}
+		// 包明细信号：pkgs 按 ExpireAt 升序，首个未过期包即该账号最早批次。
+		if len(e.pkgs) > 0 && now.Before(e.pkgs[0].ExpireAt) {
+			if best.IsZero() || e.pkgs[0].ExpireAt.Before(best) {
+				best = e.pkgs[0].ExpireAt
+			}
+			continue // 明细存在即权威，聚合快照不再参与该账号（口径与 expiringNow 一致）
 		}
 		if e.creditsEarliestRemaining <= 0 ||
 			e.creditsEarliestExpiry.IsZero() || !e.creditsEarliestExpiry.After(now) {

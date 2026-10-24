@@ -594,6 +594,49 @@ func TestModelRateCacheEffectiveAndNormalized(t *testing.T) {
 	}
 }
 
+// TestModelRateTimeGatedPromo 时段型免费优惠在窗口外必须回落牌价（实测案例：
+// hy4-preview 夜间免费 23:00→8:00，目录快照几小时不刷新，08:00 后模型组仍按
+// 「倍率 0」把它排第一，单次扣 41 积分）。窗口内取折扣价，窗口外取牌价，
+// 与目录是否刷新无关——读取时按当前时刻重估。
+func TestModelRateTimeGatedPromo(t *testing.T) {
+	c := New()
+	// 夜间免费窗口 23:00→08:00（跨午夜，同上游 modelPromotions 实测形态）。
+	c.storeModelRateWindows("cn", map[string]v3PromoSnapshot{
+		"hy4-preview": {Windows: []promoDailyWindow{{Start: 23 * 60, End: 8 * 60}}, Discounted: "0"},
+	})
+	c.storeModelRates("cn", []ModelInfo{
+		// 牌价 0.29，生效价 0（窗口内免费）。
+		{ID: "hy4-preview", Credits: "x0.29", PromoFactor: floatPtr(0), PromoCredits: "0x"},
+		{ID: "plain", Credits: "x0.79"},
+	})
+	if got := c.ModelRate("cn", "plain"); got != "0.79" {
+		t.Fatalf("plain rate=%q want 0.79", got)
+	}
+	// 窗口内/外由当前时刻决定：用可注入时钟验证两个分支。
+	inWin := time.Date(2026, 10, 19, 23, 30, 0, 0, promoZone)  // 窗口内
+	outWin := time.Date(2026, 10, 19, 8, 0, 58, 0, promoZone) // 刚出窗口
+	if got := c.modelRateAt("cn", "hy4-preview", inWin); got != "0" {
+		t.Fatalf("in-window rate=%q want 0 (free)", got)
+	}
+	if got := c.modelRateAt("cn", "hy4-preview", outWin); got != "0.29" {
+		t.Fatalf("out-of-window rate=%q want 0.29 (list price)", got)
+	}
+	// 跨午夜两段各自命中：凌晨 1 点在窗口内，中午 12 点不在。
+	if got := c.modelRateAt("cn", "hy4-preview", time.Date(2026, 10, 19, 1, 0, 0, 0, promoZone)); got != "0" {
+		t.Fatalf("1am rate=%q want 0 (free)", got)
+	}
+	if got := c.modelRateAt("cn", "hy4-preview", time.Date(2026, 10, 19, 12, 0, 0, 0, promoZone)); got != "0.29" {
+		t.Fatalf("noon rate=%q want 0.29", got)
+	}
+	// 无窗口模型不受影响。
+	if got := c.modelRateAt("cn", "plain", inWin); got != "0.79" {
+		t.Fatalf("plain in-window rate=%q want 0.79", got)
+	}
+}
+
+// floatPtr 测试辅助。
+func floatPtr(v float64) *float64 { return &v }
+
 func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 	// CLI 目录给 flash 精简字段（128K / 固定 high）；IDE /v3/config 给完整能力。
 	var sawIDE bool

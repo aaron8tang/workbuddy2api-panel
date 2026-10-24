@@ -339,7 +339,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', trae: 'TRAE 渠道', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', trae: 'TRAE 渠道', cosy: 'Qoder 渠道', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -352,6 +352,7 @@ function go(v) {
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   if (v === 'trae') loadTrae();
+  if (v === 'cosy') loadCosy();
   // 到期提醒卡片不再「打开账号池就自动查」：逐账号实时查上游，账号一多打开面板
   // 就卡死。数据只由卡片上的「检查」按钮显式触发；卡片初始隐藏。
   if (v === 'taskscenter') reattachQueueView();
@@ -935,6 +936,10 @@ function mgOpenEditor(i) {
   // 用 center 而不是 nearest：编辑器高约 300px，nearest 在顶边已入视口时不再滚动，
   // 保存/取消按钮会留在折叠线下，用户会以为「点了没反应」。
   $('mgEditor').scrollIntoView({ block: 'center' });
+  // 模型 chips 数据源（mdAll）只在进「模型与档位」视图时拉过——直接进模型组
+  // 编辑器时是空的，chips 只剩提示文案（渠道前缀模型如 officeace:/codearts:
+  // 全在目录尾部，最容易被漏看）。这里自动补拉一次，拉完重渲 chips。
+  if (!mdAll.length) loadModels().then(() => mgRenderChips());
 }
 
 function mgUpdatePreview() {
@@ -949,11 +954,12 @@ function mgLines(taId) {
 // 模型来自模型目录缓存 mdAll（需先点上方「重新获取」拉一次）；账号来自池清单。
 function mgRenderChips() {
   const curM = mgLines('mgModels');
-  // 前 80 条 + trae 条目补齐（trae 模型追加在目录尾部，截断可能切掉；
-  // 组编辑器需要能点选 trae: 前缀模型进组）。
+  // 前 80 条 + 带渠道前缀的条目补齐（trae:/qoder:/... 追加在目录尾部，截断可能
+  // 切掉；组编辑器需要能点选渠道前缀模型进组）。
+  const PREFIXED = /^(trae|qoder|qoderwork|qwenwork|codearts|officeace|autoclaw):/;
   const chipList = mdAll.slice(0, 80);
   for (const m of mdAll.slice(80)) {
-    if (String(m.id || '').startsWith('trae:')) chipList.push(m);
+    if (PREFIXED.test(String(m.id || ''))) chipList.push(m);
   }
   $('mgModelChips').innerHTML = chipList.length
     ? chipList.map(m => {
@@ -992,6 +998,12 @@ async function mgPost(groups) {
     mgEditing = -1;
     $('mgNote').textContent = mgGroups.length ? mgGroups.length + ' 个模型组' : '';
     toast('模型组已保存并生效（无需重启）', 'ok');
+    // 思考档位自动更正：后端把模型不支持的 |档位 校正到最近档，此处回显改了什么
+    //（entries 已被后端改写并在 d.groups 生效，用户看到的是"保存后实际是什么"）。
+    const fixes = d.effort_fixes || [];
+    if (fixes.length) {
+      toast('已自动更正 ' + fixes.length + ' 个思考档：' + fixes.map(f => f.from + ' → ' + f.to).join('；'), 'warn');
+    }
   } catch (e) {
     $('mgEditNote').textContent = '保存失败：' + e.message;
   }
@@ -1239,6 +1251,12 @@ const CFG_MAP = {
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
+  channel_checkin_enabled: ['schedule', 'channel_checkin', 'enabled'],
+  channel_checkin_exclude: ['schedule', 'channel_checkin', 'exclude'],
+  failover_enabled: ['failover', 'enabled'],
+  failover_exclude: ['failover', 'exclude'],
+  failover_max_channels: ['failover', 'max_channels'],
+  failover_skip_on_credit: ['failover', 'skip_on_credit'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
@@ -1304,8 +1322,10 @@ function collectConfig() {
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
     else {
       const raw = el.value.trim();
+      // 渠道排除名单：逗号分隔 → 字符串数组（清空 = 明确要全部参与，照发 []）。
+      if (name.endsWith('_exclude')) v = raw.split(/[,，\s]+/).filter(Boolean);
       // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
-      if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
+      else if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }
@@ -1723,6 +1743,398 @@ $('btnTraeCheckin').onclick = async () => {
   finally { b.disabled = false; }
 };
 
+/* ── Qoder 渠道（COSY 三渠道：qoder / qoderwork / qwenwork）──────────
+   每渠道一个 box：状态探测 404 = 渠道未装配（隐藏 box）；三 box 全 404 =
+   显示「渠道未启用」整卡。账号行操作对齐 TRAE 视图（启停/刷新/移除），
+   qoder 另有设备流登录，qoderwork 另有签到/查余额。 */
+const COSY_CHANNELS = ['qoder', 'qoderwork', 'qwenwork', 'codearts', 'officeace', 'autoclaw'];
+let cosyLoginPending = null, cosyLoginTimer = null, cosyLoginCh = null;
+let cosyEnabled = { qoder: null, qoderwork: null, qwenwork: null, codearts: null, officeace: null, autoclaw: null }; // null=未知（未探测）
+
+async function loadCosy(quiet) {
+  // 并发探测三渠道状态（404 = 未装配 → 隐藏对应 box）。全 404 显示整卡提示。
+  const results = await Promise.all(COSY_CHANNELS.map(async ch => {
+    try { const st = await api(ch + '/status'); return { ch, st }; }
+    catch (e) { if (String(e.message).includes('404')) return { ch, st: null }; throw e; }
+  }));
+  let any = false;
+  for (const { ch, st } of results) {
+    const box = $('cosyBox-' + ch);
+    const on = !!st;
+    cosyEnabled[ch] = on;
+    box.hidden = !on;
+    if (!on) continue;
+    any = true;
+    $('cosyNote-' + ch).textContent = st.servable ? '渠道可服务' : (st.has_accounts ? '账号均在冷却/禁用' : '暂无账号');
+    await renderCosyAccounts(ch, quiet);
+  }
+  $('cosyDisabled').hidden = any;
+  $('cosyMain').style.display = any ? '' : 'none';
+}
+async function renderCosyAccounts(ch, quiet) {
+  const tb = $('cosyBody-' + ch);
+  let list;
+  try { list = (await api(ch + '/accounts')).accounts || []; }
+  catch (e) {
+    if (!quiet) toast('读取 ' + ch + ' 账号失败：' + e.message, 'err');
+    return;
+  }
+  if (!list.length) {
+    const tip = ch === 'qoder' ? '点右上角「设备流登录」添加账号，或粘贴凭证 JSON 导入'
+      : ch === 'qoderwork' ? '点右上角「导入凭证」粘贴账号 JSON（嵌套 auth/account 或扁平形态）'
+      : ch === 'codearts' ? '点右上角「Web 登录」完成华为云授权（portal 自动回调落盘），或粘贴凭证 JSON 导入'
+      : ch === 'officeace' ? '点右上角「Web 登录」完成华为云授权（云端轮询取码自动落盘），或粘贴凭证 JSON 导入'
+      : ch === 'autoclaw' ? '点右上角「手机登录」完成验证码登录（发码 → 填验证码），或粘贴 token / 桌面端 auth.json 导入'
+      : '从桌面端解密 auth-v2.dat 后点「导入凭证」粘贴 JSON';
+    tb.innerHTML = '<tr><td colspan="5"><div class="empty"><div class="big">' + ch + ' 账号是空的</div>' + tip + '</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = list.map(s => {
+    let cls = '', tag;
+    if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
+    else if (s.cooling) { cls = 'cool'; tag = '<span class="tag warn">冷却中</span>'; }
+    else tag = '<span class="tag ok">可用</span>';
+    const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    const name = s.nickname ? esc(s.nickname) : '<span class="hint">未命名</span>';
+    const sub = ch === 'qoder' ? (s.email || '')
+      : ch === 'qoderwork' ? (s.plan || '')
+      : ch === 'codearts' ? (s.user_name || '')
+      : ch === 'officeace' ? (s.base_url || '')
+      : ch === 'autoclaw' ? (s.email || s.user_id || '')
+      : (s.email || s.username || '');
+    const uidShort = s.uid.length > 12 ? s.uid.slice(0, 12) + '…' : s.uid;
+    const err = s.err_count ? ' · 连败 ' + s.err_count : '';
+    // Token/凭据到期列：qoder=dt_expires_at / qwenwork=token_expires_at（Unix 秒）；
+    // codearts/officeace=expires_at_ms（毫秒）。
+    const expAtMs = s.expires_at_ms || 0;
+    const expAt = s.dt_expires_at || s.token_expires_at || 0;
+    let exp = '—';
+    if (expAtMs > 0) exp = new Date(expAtMs).toLocaleString();
+    else if (expAt > 0) exp = new Date(expAt * 1000).toLocaleString();
+    const balance = ch === 'qoderwork'
+      ? '<td>' + (s.credits > 0 || s.exhausted ? (s.exhausted ? '<span class="tag bad">已耗尽</span>' : s.credits) : (s.credits || '—')) + '</td>'
+      : '';
+    const toggle = s.disabled
+      ? '<button class="xs" data-a="cosy-enable" data-ch="' + ch + '" data-u="' + esc(s.uid) + '">启用</button>'
+      : '<button class="xs" data-a="cosy-disable" data-ch="' + ch + '" data-u="' + esc(s.uid) + '">禁用</button>';
+    const extraBtns =
+      (ch === 'qoderwork' ? '<button class="xs" data-a="cosy-credits" data-ch="' + ch + '" data-u="' + esc(s.uid) + '">查余额</button>' : '') +
+      (ch === 'codearts' ? '<button class="xs" data-a="cosy-balance" data-ch="' + ch + '" data-u="' + esc(s.uid) + '">查余额</button>' : '') +
+      (ch === 'officeace' ? '<button class="xs" data-a="cosy-balance" data-ch="' + ch + '" data-u="' + esc(s.uid) + '">查余额</button>' : '');
+    return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
+      '<td class="mark" aria-hidden="true"><i></i></td>' +
+      '<td>' + name + (sub ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3)">' + esc(sub) + '</div>' : '') +
+        '<div class="hint" style="font-size:11.5px;color:var(--ink-3)">' + esc(uidShort) + err + '</div>' + note + '</td>' +
+      '<td>' + tag + '</td>' +
+      balance +
+      '<td>' + exp + '</td>' +
+      '<td class="c-acts">' +
+      extraBtns +
+      toggle +
+      '<button class="xs" data-a="cosy-refresh" data-ch="' + ch + '" data-u="' + esc(s.uid) + '">刷新</button>' +
+      '<button class="xs ghost" data-a="cosy-json" data-ch="' + ch + '" data-u="' + esc(s.uid) + '">凭证</button>' +
+      '<button class="xs ghost danger" data-a="cosy-del" data-ch="' + ch + '" data-u="' + esc(s.uid) + '">移除</button></td>' +
+      '</tr>';
+  }).join('');
+}
+
+/* 账号行操作（事件委托挂 document：表格 innerHTML 全量重渲染后仍有效） */
+document.addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-a^="cosy-"]');
+  if (!b) return;
+  const ch = b.dataset.ch, uid = b.dataset.u, act = b.dataset.a, enc = encodeURIComponent(uid);
+  if (act === 'cosy-enable' || act === 'cosy-disable') {
+    b.disabled = true;
+    try {
+      await api(ch + '/accounts/' + enc, { method: 'PATCH', body: JSON.stringify({ action: act === 'cosy-enable' ? 'enable' : 'disable' }) });
+      toast(act === 'cosy-enable' ? '已启用' : '已禁用', 'ok');
+      loadCosy(true);
+    } catch (e) { toast('操作失败：' + e.message, 'err'); b.disabled = false; }
+    return;
+  }
+  if (act === 'cosy-refresh') {
+    b.disabled = true; b.textContent = '刷新中…';
+    try {
+      await api(ch + '/accounts/' + enc + '/refresh', { method: 'POST' });
+      toast('Token 已刷新', 'ok');
+      loadCosy(true);
+    } catch (e) { toast('刷新失败：' + e.message, 'err'); }
+    finally { b.disabled = false; b.textContent = '刷新'; }
+    return;
+  }
+  if (act === 'cosy-credits') {
+    b.disabled = true;
+    try {
+      const r = await api(ch + '/accounts/' + enc + '/credits', { method: 'POST' });
+      let msg = '剩余额度 ' + r.credit + (r.exceeded ? '（已超限，冷却中）' : '');
+      if (Array.isArray(r.buckets) && r.buckets.length) {
+        msg += '\n' + r.buckets.map(x => x.name + ': ' + (x.remain ?? '—') + (x.total != null ? '/' + x.total : '')).join('，');
+      }
+      toast(msg, r.exceeded ? 'err' : 'ok');
+      loadCosy(true);
+    } catch (e) { toast('查询失败：' + e.message, 'err'); }
+    finally { b.disabled = false; }
+    return;
+  }
+  if (act === 'cosy-balance') {
+    b.disabled = true;
+    try {
+      const r = await api(ch + '/accounts/' + enc + '/balance', { method: 'POST' });
+      if (ch === 'codearts') {
+        const parts = [];
+        if (r.statistics && Array.isArray(r.statistics.meters)) {
+          r.statistics.meters.forEach(m => {
+            if (m.credit_remaining != null) parts.push(m.label + ' 余 ' + m.credit_remaining);
+            else if (m.allowance_tokens) parts.push(m.label + ' 用 ' + m.used_tokens + '/' + m.allowance_tokens);
+          });
+        }
+        if (r.benefit) parts.push('福利日池 ' + r.benefit.daily_tokens_used + '/' + (r.benefit.daily_token_limit > 0 ? r.benefit.daily_token_limit : '无上限'));
+        else if (r.benefit_absent) parts.push('无福利池');
+        toast(parts.length ? parts.join('，') : '已查询（无明细）', 'ok');
+      } else {
+        const sub = r.subscription || {};
+        toast('可用 ' + sub.available + ' ' + (sub.unit || '积分') + '（套餐 ' + sub.remainQuota + ' + 奖励 ' + ((sub.available || 0) - (sub.remainQuota || 0)) + '）', 'ok');
+      }
+      loadCosy(true);
+    } catch (e) { toast('查询失败：' + e.message, 'err'); }
+    finally { b.disabled = false; }
+    return;
+  }
+  if (act === 'cosy-json') {
+    try {
+      const r = await fetch('/panel/api/' + ch + '/accounts/' + enc + '/json', { headers: { 'Authorization': 'Bearer ' + (localStorage.getItem(LS_KEY) || '') } });
+      const t = await r.text();
+      if (!r.ok) throw new Error(t || ('HTTP ' + r.status));
+      navigator.clipboard.writeText(t).then(
+        () => toast('凭证 JSON 已复制到剪贴板', 'ok'),
+        () => { prompt('复制失败，请手动复制：', t); });
+    } catch (e) { toast('读取凭证失败：' + e.message, 'err'); }
+    return;
+  }
+  if (act === 'cosy-del') {
+    if (!confirm('移除 ' + ch + ' 账号 ' + uid + '？将删除 auths/ 下的凭证文件，不可恢复。')) return;
+    b.disabled = true;
+    try {
+      await api(ch + '/accounts/' + enc, { method: 'DELETE' });
+      toast('已移除', 'ok');
+      loadCosy(true);
+    } catch (e) { toast('移除失败：' + e.message, 'err'); b.disabled = false; }
+  }
+});
+
+/* 凭证导入（每渠道独立 pad + 按钮） */
+COSY_CHANNELS.forEach(ch => {
+  $('btnCosyImportToggle-' + ch).onclick = () => { $('cosyImportPad-' + ch).hidden = !$('cosyImportPad-' + ch).hidden; };
+  $('btnCosyImport-' + ch).onclick = async () => {
+    const t = $('cosyImportText-' + ch).value.trim();
+    const note = $('cosyImportNote-' + ch);
+    if (!t) { note.textContent = '请先粘贴内容'; return; }
+    note.textContent = '导入中…';
+    try {
+      const r = await api(ch + '/accounts/import', { method: 'POST', body: JSON.stringify({ json: t }) });
+      note.textContent = '';
+      $('cosyImportText-' + ch).value = '';
+      toast('已添加 ' + ch + ' 账号 ' + (r.nickname || r.uid || r.name || ''), 'ok');
+      loadCosy(true);
+    } catch (e) { note.textContent = '导入失败：' + e.message; }
+  };
+});
+
+/* COSY 设备流登录（qoder/qoderwork/qwenwork/codearts/officeace 五渠道共用一套流程：
+   POST {ch}/login → 打开 verify_url → 2s 轮询 {ch}/login/result → ok 收尾；
+   codearts 的回调经本机 :18081/oauth/callback 自动完成（portal 只认 port），
+   officeace 由服务端轮询云端取码，前端轮询 login/result 语义一致） */
+const COSY_LOGIN_CHANNELS = ['qoder', 'qoderwork', 'qwenwork', 'codearts', 'officeace'];
+function cosySetLoginUI(ch, on) {
+  $('cosyLoginPad-' + ch).hidden = !on;
+  $('btnCosyLogin-' + ch).disabled = on;
+}
+function stopCosyLogin() { if (cosyLoginTimer) { clearInterval(cosyLoginTimer); cosyLoginTimer = null; } }
+COSY_LOGIN_CHANNELS.forEach(ch => {
+  $('btnCosyLogin-' + ch).onclick = async () => {
+    stopCosyLogin();
+    cosySetLoginUI(ch, true);
+    cosyLoginCh = ch;
+    $('cosyLoginMsg-' + ch).textContent = '正在生成登录链接…';
+    $('cosyLoginUrl-' + ch).textContent = '';
+    try {
+      const r = await api(ch + '/login', { method: 'POST', body: '{}' });
+      cosyLoginPending = r.nonce;
+      $('cosyLoginMsg-' + ch).textContent = '请在打开的页面完成登录并确认授权，成功后自动导入';
+      $('cosyLoginUrl-' + ch).textContent = r.verify_url;
+      open(r.verify_url, '_blank');
+      cosyLoginTimer = setInterval(pollCosyLogin, 2000);
+    } catch (e) {
+      cosySetLoginUI(ch, false);
+      toast('发起登录失败：' + e.message, 'err');
+    }
+  };
+  $('btnCosyCancelLogin-' + ch).onclick = async () => {
+    if (cosyLoginPending) {
+      try { await api(ch + '/login/cancel', { method: 'POST', body: JSON.stringify({ nonce: cosyLoginPending }) }); }
+      catch (e) { /* 会话可能已过期：忽略 */ }
+    }
+    stopCosyLogin();
+    cosySetLoginUI(ch, false);
+    cosyLoginPending = null;
+  };
+  $('btnCosyOpenUrl-' + ch).onclick = () => open($('cosyLoginUrl-' + ch).textContent, '_blank');
+  $('btnCosyCopyUrl-' + ch).onclick = () => navigator.clipboard.writeText($('cosyLoginUrl-' + ch).textContent)
+    .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+});
+async function pollCosyLogin() {
+  const ch = cosyLoginCh || 'qoder';
+  if (!cosyLoginPending) { stopCosyLogin(); return; }
+  try {
+    const r = await api(ch + '/login/result?nonce=' + encodeURIComponent(cosyLoginPending));
+    if (r.status === 'ok' || r.status === 'error' || r.status === 'expired') {
+      stopCosyLogin();
+      cosySetLoginUI(ch, false);
+      cosyLoginPending = null;
+      if (r.status === 'ok') { toast(ch + ' 账号已添加：' + (r.name || r.uid), 'ok'); loadCosy(true); }
+      else toast('登录' + (r.status === 'expired' ? '会话已过期' : '失败') + '：' + (r.error || ''), 'err');
+    }
+  } catch (e) {
+    if (String(e.message).includes('404')) {
+      stopCosyLogin();
+      cosySetLoginUI(ch, false);
+      cosyLoginPending = null;
+      toast('登录会话已过期，请重试', 'err');
+    }
+  }
+}
+
+/* qoderwork 全量签到 / 模型目录强刷（qoderwork、qwenwork 共用按钮形态） */
+$('btnCosyCheckin-qoderwork').onclick = async () => {
+  const b = $('btnCosyCheckin-qoderwork');
+  b.disabled = true;
+  try {
+    const r = await api('qoderwork/checkin', { method: 'POST' });
+    const ok = (r.results || []).filter(x => x.ok).length;
+    const already = (r.results || []).filter(x => x.already).length;
+    toast('签到完成：' + ok + ' 成功，' + already + ' 已领过，共 ' + (r.results || []).length, 'ok');
+    loadCosy(true);
+  } catch (e) { toast('签到失败：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+$('btnCosyCheckin-officeace').onclick = async () => {
+  const b = $('btnCosyCheckin-officeace');
+  b.disabled = true;
+  try {
+    const r = await api('officeace/checkin', { method: 'POST' });
+    const ok = (r.results || []).filter(x => x.ok).length;
+    const lines = (r.results || []).map(x => x.uid.slice(0, 10) + '…: ' + (x.msg || (x.ok ? '成功' : '失败')));
+    toast('签到完成：' + ok + '/' + (r.results || []).length + ' 成功' + (lines.length ? '\n' + lines.join('\n') : ''), ok ? 'ok' : 'err');
+    loadCosy(true);
+  } catch (e) { toast('签到失败：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+$('btnCosyModels-qoderwork').onclick = async () => {
+  const b = $('btnCosyModels-qoderwork');
+  b.disabled = true;
+  try { const r = await api('qoderwork/models/refresh', { method: 'POST' }); toast('模型目录已刷新：' + r.count + ' 个', 'ok'); }
+  catch (e) { toast('刷新失败（静态兜底生效中）：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+$('btnCosyModels-qwenwork').onclick = async () => {
+  const b = $('btnCosyModels-qwenwork');
+  b.disabled = true;
+  try { const r = await api('qwenwork/models/refresh', { method: 'POST' }); toast('模型目录已刷新：' + r.count + ' 个', 'ok'); }
+  catch (e) { toast('刷新失败（静态兜底生效中）：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+$('btnCosyModels-autoclaw').onclick = async () => {
+  const b = $('btnCosyModels-autoclaw');
+  b.disabled = true;
+  try { const r = await api('autoclaw/models/refresh', { method: 'POST' }); toast('模型目录已刷新：' + r.count + ' 个', 'ok'); }
+  catch (e) { toast('刷新失败：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+$('btnCosyCheckin-autoclaw').onclick = async () => {
+  const b = $('btnCosyCheckin-autoclaw');
+  b.disabled = true;
+  try {
+    const r = await api('autoclaw/checkin', { method: 'POST' });
+    const ok = (r.results || []).filter(x => x.ok).length;
+    const lines = (r.results || []).map(x => x.uid.slice(0, 10) + '…: ' + (x.msg || (x.ok ? '成功' : '失败')));
+    toast('签到完成：' + ok + '/' + (r.results || []).length + ' 成功' + (lines.length ? '\n' + lines.join('\n') : ''), ok ? 'ok' : 'err');
+    loadCosy(true);
+  } catch (e) { toast('签到失败：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+/* AutoClaw「手机登录」按钮：只展开本地两步面板（发码/填码），不走设备流轮询 */
+$('btnCosyLogin-autoclaw').onclick = () => {
+  const pad = $('cosyLoginPad-autoclaw');
+  pad.hidden = !pad.hidden;
+  $('btnCosyLogin-autoclaw').disabled = !pad.hidden;
+  if (!pad.hidden) $('cosyLoginMsg-autoclaw').textContent = '填手机号 → 点发验证码';
+};
+/* 两步：发码 → 验证码（不是设备流，不走 login/result 轮询） */
+$('btnCosySend-autoclaw').onclick = async () => {
+  const phone = $('cosyPhone-autoclaw').value.trim();
+  if (!/^1\d{10}$/.test(phone)) { toast('手机号格式不对（要 11 位数字）', 'err'); return; }
+  const b = $('btnCosySend-autoclaw');
+  b.disabled = true;
+  try {
+    await api('autoclaw/login/send-code', { method: 'POST', body: JSON.stringify({ phone }) });
+    $('cosyLoginMsg-autoclaw').textContent = '验证码已发送，填到下面点登录';
+    toast('验证码已发送', 'ok');
+  } catch (e) { toast('发码失败：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+$('btnCosyVerify-autoclaw').onclick = async () => {
+  const code = $('cosyCode-autoclaw').value.trim();
+  if (!/^\d+$/.test(code)) { toast('验证码要纯数字', 'err'); return; }
+  const b = $('btnCosyVerify-autoclaw');
+  b.disabled = true;
+  try {
+    const r = await api('autoclaw/login/verify', { method: 'POST', body: JSON.stringify({ code }) });
+    $('cosyLoginMsg-autoclaw').textContent = '登录成功：' + (r.name || r.uid);
+    $('cosyCode-autoclaw').value = '';
+    toast('登录成功，账号已加入列表', 'ok');
+    loadCosy(true);
+  } catch (e) { toast('登录失败：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+/* AutoClaw「导入桌面端登录态」：读本机 auth.json（DPAPI 解密），免手工拷贝 */
+$('btnAcDesktop-autoclaw').onclick = async () => {
+  const b = $('btnAcDesktop-autoclaw');
+  b.disabled = true;
+  try {
+    const r = await api('autoclaw/desktop/import', { method: 'POST', body: JSON.stringify({}) });
+    toast('已导入桌面端登录态：' + (r.name || r.uid), 'ok');
+    loadCosy(true);
+  } catch (e) { toast('导入桌面端登录态失败：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+/* 可用性探测：桌面端登录态读不到时把按钮置灰并给出原因，避免用户点了才报错 */
+(async () => {
+  const btn = $('btnAcDesktop-autoclaw');
+  if (!btn) return;
+  try {
+    const s = await api('autoclaw/desktop');
+    if (!s.available) {
+      btn.disabled = true;
+      btn.title = s.reason || '桌面端登录态不可用';
+      btn.classList.remove('primary');
+    }
+  } catch (e) { /* 探测失败就保持按钮可用，点了由后端给具体原因 */ }
+})();
+$('btnCosyModels-codearts').onclick = async () => {
+  const b = $('btnCosyModels-codearts');
+  b.disabled = true;
+  try { const r = await api('codearts/models/refresh', { method: 'POST' }); toast('模型目录已刷新：' + r.count + ' 个', 'ok'); }
+  catch (e) { toast('刷新失败：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+$('btnCosyModels-officeace').onclick = async () => {
+  const b = $('btnCosyModels-officeace');
+  b.disabled = true;
+  try { const r = await api('officeace/models/refresh', { method: 'POST' }); toast('模型目录已刷新：' + r.count + ' 个（不可用模型已探测隐藏）', 'ok'); }
+  catch (e) { toast('刷新失败：' + e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
 $('btnRefresh').onclick = async () => {
@@ -1742,6 +2154,7 @@ function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
   else if (view === 'trae') loadTrae(true);
+  else if (view === 'cosy') loadCosy(true);
   else if (view === 'taskscenter') reattachQueueView();
 }
 function start() {

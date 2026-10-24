@@ -16,8 +16,11 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	cosypool "github.com/linguo2625469/workbuddy2api-panel/internal/cosy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelgroup"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qoder"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qoderwork"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	traeauth "github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
 	traepool "github.com/linguo2625469/workbuddy2api-panel/internal/trae/pool"
@@ -453,6 +456,94 @@ func TestChatGroupDefaultExpiryOrderAcrossRealms(t *testing.T) {
 	p.SetCreditsDetailed("u1", 1000, 0, 0, time.Time{}, 1000)
 	if m, _ := h.groupDefaultModel(&g); m != "trae:glm-5.2" {
 		t.Fatalf("cn expiry unknown: default = %q, want trae:glm-5.2", m)
+	}
+}
+
+// TestChatGroupQoderBoostWhenNoExpiring 用户规则第三层：主池与 trae 都无 24h 内
+// 到期积分时，qoder/qoderwork 条目优先使用（COSY 渠道积分无批次概念，不用就留着）；
+// 两渠道都不可服务或主池/trae 有临期信号时，回到「谁先到期用谁」既有规则。
+func TestChatGroupQoderBoostWhenNoExpiring(t *testing.T) {
+	up := newRecordUpstream(t)
+	// 主池账号：无到期明细（SetCreditsDetailed 拉平），对照组场景。
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	groups := []modelgroup.Group{
+		// trae/cn 故意写在前：boost 生效时书写序必须让位于层键。
+		// qoderwork 写在 qoder 之后：层内两渠道按书写顺序。
+		{Name: "dev", Models: []string{"trae:glm-5.2", "cn:glm-5.2", "qoder:Qwen3.8-Flash", "qoderwork:qw-model"}},
+	}
+	tp := traepool.New("")
+	tp.Add(&traeauth.Auth{UID: "t1", AccessToken: "tat", ExpiresAt: 9999999999})
+	// trae 重置日取「今天+10 天」的日期号：无临期明细时重置估算在 ~9-11 天后，
+	// 恒在 24h 窗口外（traeSoon=false），且远晚于主池任何 24h 包。
+	gw := trae.New(trae.Config{
+		Pool: tp, Upstream: traeupstream.New(), WorkMode: "disabled",
+		CreditResetDay: time.Now().AddDate(0, 0, 10).Day(),
+	})
+	// qoder 渠道：一个健康账号（无冷却即 Servable）。
+	qp := cosypool.NewPool("")
+	qp.Add(cosypool.NewAccount("q1", "qoder-a", cosypool.Fingerprint{}, &qoder.Cred{UID: "q1"}))
+	qw := qoder.New(qoder.Config{Pool: qp, Upstream: qoder.NewClient()})
+	// qoderwork 渠道：同样一个健康账号。
+	qwp := cosypool.NewPool("")
+	qwp.Add(cosypool.NewAccount("qw1", "qoderwork-a", cosypool.Fingerprint{}, &qoderwork.Cred{UID: "qw1"}))
+	qww := qoderwork.New(qoderwork.Config{Pool: qwp, Upstream: qoderwork.NewClient()})
+	reg := modelgroup.NewRegistry(groups)
+	h := NewHandler(Config{Pool: p, Upstream: up.up, ModelGroups: reg, Trae: gw, Qoder: qw, QoderWork: qww})
+	g, ok := reg.Lookup("dev")
+	if !ok {
+		t.Fatal("group dev missing")
+	}
+
+	// 场景 1：主池/trae 均无临期 → qoder 条目 boosting 到最前（层内书写序：
+	// qoder 写在 qoderwork 之前）。
+	if m, _ := h.groupDefaultModel(&g); m != "qoder:Qwen3.8-Flash" {
+		t.Fatalf("no expiring anywhere: default = %q, want qoder:Qwen3.8-Flash", m)
+	}
+
+	// 场景 2：主池出现 24h 内到期批次（今夜 23:00）→ boost 关闭，
+	// 回落「谁先到期用谁」：主池临期包恒早于 trae 重置估算 → cn 条目。
+	now := time.Now()
+	tonight := time.Date(now.Year(), now.Month(), now.Day(), 23, 0, 0, 0, now.Location())
+	if !tonight.After(now) {
+		tonight = tonight.AddDate(0, 0, 1)
+	}
+	p.SetCreditPackages("u1", []pool.PkgSnapshot{{Remain: 500, ExpireAt: tonight}})
+	p.SetCreditsDetailed("u1", 1000, 0, 0, tonight, 1000)
+	if m, _ := h.groupDefaultModel(&g); m != "cn:glm-5.2" {
+		t.Fatalf("pool expiring: default = %q, want cn:glm-5.2 (expiry order)", m)
+	}
+
+	// 场景 3：主池包撤掉、trae 有 24h 内到期明细 → boost 关闭，
+	// trae 真实明细早于其月度重置估算 → trae 条目。
+	p.SetCreditPackages("u1", nil)
+	p.SetCreditsDetailed("u1", 1000, 0, 0, time.Time{}, 1000)
+	tp.SetCreditExpiry("t1", now.Add(20*time.Hour).Unix(), []traepool.CreditPack{{Remain: 147.5, ExpireAt: now.Add(20 * time.Hour).Unix()}})
+	if m, _ := h.groupDefaultModel(&g); m != "trae:glm-5.2" {
+		t.Fatalf("trae expiring: default = %q, want trae:glm-5.2", m)
+	}
+
+	// 场景 4：trae 明细也撤掉（重置估算远在窗口外）→ boost 回开 → qoder。
+	tp.SetCreditExpiry("t1", 0, nil)
+	if m, _ := h.groupDefaultModel(&g); m != "qoder:Qwen3.8-Flash" {
+		t.Fatalf("boost back on: default = %q, want qoder:Qwen3.8-Flash", m)
+	}
+
+	// 场景 5：qoder 全冷却，但 qoderwork 仍健康 → 层 2 继续生效，
+	// 默认落到层内书写序下一个（qoderwork 条目）。
+	for _, st := range qp.List() {
+		qp.Cooldown(st.UID, cosypool.CoolErr, time.Hour, "test cooling")
+	}
+	if m, _ := h.groupDefaultModel(&g); m != "qoderwork:qw-model" {
+		t.Fatalf("qoder cooling but qoderwork healthy: default = %q, want qoderwork:qw-model", m)
+	}
+
+	// 场景 6：qoderwork 也全冷却 → 两渠道均不可服务 → 层键恒平局 →
+	// 回落既有规则（倍率均未知，保持书写序 trae 在前）。
+	for _, st := range qwp.List() {
+		qwp.Cooldown(st.UID, cosypool.CoolErr, time.Hour, "test cooling")
+	}
+	if m, _ := h.groupDefaultModel(&g); m != "trae:glm-5.2" {
+		t.Fatalf("both cosy cooling: default = %q, want trae:glm-5.2", m)
 	}
 }
 

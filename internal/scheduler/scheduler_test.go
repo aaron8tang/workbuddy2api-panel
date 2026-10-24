@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,8 +14,15 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/stagger"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
+
+// TestMain 关闭账号间错峰等待：单测多账号用例吃不起 3s+ 的真实延迟。
+func TestMain(m *testing.M) {
+	stagger.SetTestFactor(0)
+	os.Exit(m.Run())
+}
 
 func TestNextFire(t *testing.T) {
 	loc := time.Local

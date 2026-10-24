@@ -4,6 +4,7 @@ package pool
 
 import (
 	"log"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -138,6 +139,7 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 		} else {
 			e.credits = remain
 			e.creditsTotal = total
+			e.creditFrac = 0
 		}
 		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsDetailed
 		// 重新写入，不能沿用旧窗口/旧批次的缓存。
@@ -224,29 +226,38 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		return
 	}
 	if credit > 0 {
-		d := int64(credit + 0.5) // 四舍五入
-		if d > e.credits {
-			d = e.credits // 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额
-		}
-		e.credits -= d
-		if e.creditsExpiring > 0 {
-			if d > e.creditsExpiring {
-				e.creditsExpiring = 0
-			} else {
-				e.creditsExpiring -= d
+		// 小数累积扣减：上游单笔扣费常为 0.2~0.4 credit，按笔取整会吞成 0，
+		// 本地快照（credits/到期批次/pkgs）永不递减，快过期积分打空后仍被持续
+		// 选中。累积到 ≥1 才按整数扣；权威余额写入点重置 creditFrac 防双扣。
+		e.creditFrac += credit
+		d := int64(math.Floor(e.creditFrac))
+		if d >= 1 {
+			e.creditFrac -= float64(d)
+			if d > e.credits {
+				d = e.credits // 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额
+			}
+			if d > 0 {
+				e.credits -= d
+				if e.creditsExpiring > 0 {
+					if d > e.creditsExpiring {
+						e.creditsExpiring = 0
+					} else {
+						e.creditsExpiring -= d
+					}
+				}
+				if e.creditsEarliestRemaining > 0 {
+					if d >= e.creditsEarliestRemaining {
+						e.creditsEarliestRemaining = 0
+						e.creditsEarliestExpiry = time.Time{}
+					} else {
+						e.creditsEarliestRemaining -= d
+					}
+				}
+				// 包快照 FEFO 实时扣减：从最早失效的包逐包扣，让 24h/48h 到期窗口随消耗
+				// 实时收敛（否则快照里的到期批次要等每日拉取才更新，展示口径脱节）。
+				consumePkgsLocked(e, d)
 			}
 		}
-		if e.creditsEarliestRemaining > 0 {
-			if d >= e.creditsEarliestRemaining {
-				e.creditsEarliestRemaining = 0
-				e.creditsEarliestExpiry = time.Time{}
-			} else {
-				e.creditsEarliestRemaining -= d
-			}
-		}
-		// 包快照 FEFO 实时扣减：从最早失效的包逐包扣，让 24h/48h 到期窗口随消耗
-		// 实时收敛（否则快照里的到期批次要等每日拉取才更新，展示口径脱节）。
-		consumePkgsLocked(e, d)
 	}
 	if e.modelCost == nil {
 		e.modelCost = make(map[string]modelCostEntry)

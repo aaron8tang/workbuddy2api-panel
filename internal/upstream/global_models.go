@@ -120,7 +120,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	}
 	c.globalModels.Unlock()
 
-	names, infos, efforts, defaults, err := c.probeGlobalModels(a)
+	names, infos, efforts, defaults, windows, err := c.probeGlobalModels(a)
 	if err != nil || len(names) == 0 {
 		// 探测失败：负缓存 + 返回 nil（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
 		c.globalModels.Lock()
@@ -137,6 +137,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 		c.storeEfforts("global", efforts, defaults)
 	}
 	c.storeModelRates("global", infos)
+	c.storeModelRateWindows("global", windows)
 
 	// 成功：探测结果去重。names/infos 均落缓存；倍率等选号敏感字段只透出展示，
 	// 不注入 costTier。
@@ -175,14 +176,14 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 // 合并口径：桌面端条目字段权威，IDE/CLI 只补桌面端缺失的模型 id；去重 key =
 // 模型 id，输出顺序稳定。全部 v3 路失败且企业端点也失败才返回错误；单路失败
 // 降级为其余路结果 + warn 日志，互不拖累。
-func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
+func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, windows map[string]v3PromoSnapshot, err error) {
 	// probeV3 单次 /v3/config 探测（UA 参数化）。该端点对不同 UA 下发**不同模型集合**：
 	// 桌面端 / IDE / CLI 三路各有独有模型（见 probeGlobalModels 注释），故并发三路取并集。
 	probeV3 := func(ua string) chan probeResult {
 		ch := make(chan probeResult, 1)
 		go func() {
 			// chatBase 已按 realm 切 global base。
-			byID, perr := c.fetchV3ConfigModelMap(a, ua)
+			byID, wins, perr := c.fetchV3ConfigModelMap(a, ua)
 			if perr != nil {
 				ch <- probeResult{err: perr}
 				return
@@ -197,7 +198,7 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 				outInfos = append(outInfos, mi)
 			}
 			sort.Strings(ids) // map 迭代序随机，排序保输出稳定
-			ch <- probeResult{names: ids, infos: outInfos}
+			ch <- probeResult{names: ids, infos: outInfos, windows: wins}
 		}()
 		return ch
 	}
@@ -239,18 +240,18 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 
 	if v3.err != nil && enterprise.err != nil {
 		// 两路全失败 → 负缓存语义（等价原家族端点全非 2xx）。
-		return nil, nil, nil, nil, v3.err
+		return nil, nil, nil, nil, nil, v3.err
 	}
 	if v3.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（降级仅企业端点 + warn）。
 		log.Printf("WARN: [upstream] global models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
 		names, infos, efforts, defaults = extractEfforts(enterprise.infos)
-		return names, infos, efforts, defaults, nil
+		return names, infos, efforts, defaults, nil, nil
 	}
 	if enterprise.err != nil {
 		log.Printf("WARN: [upstream] global models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
 		names, infos, efforts, defaults = extractEfforts(v3.infos)
-		return names, infos, efforts, defaults, nil
+		return names, infos, efforts, defaults, v3.windows, nil
 	}
 	// 两路皆成功：v3 为主、企业端点补缺合并（含 effort 桶合并，v3 权威）。
 	v3Names, v3Infos, v3Efforts, v3Defaults := extractEfforts(v3.infos)
@@ -264,15 +265,17 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	names, infos = mergeGlobalCatalog(v3Names, v3Infos, entNames, entInfos)
 	efforts = mergeEffortBuckets(v3Efforts, entEfforts)
 	defaults = mergeEffortDefaults(v3Defaults, entDefaults)
-	return names, infos, efforts, defaults, nil
+	return names, infos, efforts, defaults, v3.windows, nil
 }
 
 // probeResult 单路模型目录探测结果（/v3/config 某 UA 路，或企业端点家族）。
 // infos 为对象形态条目（窄表探测为 nil），names 与之平行；err 非 nil 表示该路失败。
+// windows 时段型优惠快照（仅 /v3/config 路非 nil，见 applyModelPromotions 第三返回值）。
 type probeResult struct {
-	names []string
-	infos []ModelInfo
-	err   error
+	names   []string
+	infos   []ModelInfo
+	err     error
+	windows map[string]v3PromoSnapshot
 }
 
 // mergeV3Routes 按优先级合并 /v3/config 多路 UA 探测结果：routes 必须**按权威

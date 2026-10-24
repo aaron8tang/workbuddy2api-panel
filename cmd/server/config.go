@@ -108,6 +108,21 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+
+		// ChannelCheckin 逐渠道自动签到开关（挂在「签到时点」上一起跑；各渠道网关
+		// 未启用/无账号时天然跳过，无需在这里关）。
+		//
+		// 缺省全部 true（结构体零值语义是「未配置」，故用 Included/Excluded 名单而非
+		// bool map —— 见下方 include 列表的注释说明）。
+		ChannelCheckin struct {
+			// Enabled 渠道签到总开关；**指针**——nil（老 config 没这个键）按 true
+			// 处理（新功能默认开）；显式 false = 只签主账号池。
+			Enabled *bool `json:"enabled"`
+			// Exclude 不参与自动签到的渠道名单（trae/qoderwork/codearts/officeace/
+			// autoclaw）。缺省空 = 全部参与；填了名字的跳过。用「排除名单」而非
+			// 逐个 bool：新增渠道时无需改配置结构就自动纳入（缺省即参与）。
+			Exclude []string `json:"exclude"`
+		} `json:"channel_checkin"`
 	} `json:"schedule"`
 
 	Global struct {
@@ -173,6 +188,24 @@ type Config struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
 	} `json:"upstash"`
+
+	// Failover 跨渠道失败转移（单渠道连续失败 N 次即切下一渠道，而非把错误
+	// 透传给客户端）。
+	Failover struct {
+		// Enabled 总开关，缺省 true（老配置无此键 → 开启）。false = 只走单渠道
+		// 既有轮转（老行为）。
+		Enabled *bool `json:"enabled"`
+		// ChannelFails 单渠道连续失败多少次就切下一渠道；0/空 = 2。
+		// 「连续」而非「累计」：成功即清零，单次偶发失败不该切渠道。
+		ChannelFails int `json:"channel_fails"`
+		// SkipOnCredit 积分耗尽时是否停止转移。缺省 true：ErrHardCredit（402/额度
+		// 耗尽）意味着这个号今天没钱了，但**别的渠道**可能还有钱——所以本开关
+		// 语义是「同一渠道内耗尽不重试」，跨渠道仍会转移。false = 耗尽也继续
+		// 按序转移（更激进，可能把请求放大到全渠道）。
+		SkipOnCredit *bool `json:"skip_on_credit"`
+		// MaxChannels 单请求最多尝试多少个渠道；0/空 = 全部。
+		MaxChannels int `json:"max_channels"`
+	} `json:"failover"`
 
 	Pool struct {
 		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
@@ -269,6 +302,69 @@ type Config struct {
 		UserAgent string `json:"user_agent"`
 	} `json:"trae"`
 
+	// Qoder / QoderWork / QwenWork COSY 协议族三渠道段：独立账号池/凭证目录，
+	// 由主路由按 "qoder:"/"qoderwork:"/"qwenwork:" 模型前缀分发。
+	// 缺省无账号 → 完全不参与服务（零回归）。字段语义同 Trae 段的对应子集。
+	Qoder     CosyChannel `json:"qoder"`
+	QoderWork CosyChannel `json:"qoderwork"`
+	QwenWork  CosyChannel `json:"qwenwork"`
+
+	// CodeArts 华为云 CodeArts 渠道段：STS OAuth PKCE+DPoP 登录、SDK-HMAC-SHA256
+	// 签名出站、3 路并发会话心跳。模型以 "codearts:" 前缀暴露。
+	CodeArts struct {
+		// Enabled 渠道总开关，缺省 true。无账号时天然不服务，显式 false 是逃生门。
+		Enabled bool `json:"enabled"`
+		// AuthDir 凭证目录（codearts-*.json）；空 = 跟随顶层 auth_dir。
+		AuthDir string `json:"auth_dir"`
+		// CallbackPort Web 登录回调监听端口（portal 只认 port、路径它固定拼
+		// /oauth/callback），默认 "18081"；"0" = 不起 listener（Web 登录不可用）。
+		CallbackPort string `json:"callback_port"`
+		// MaxRotate 单请求最多换号次数；0 = 3。
+		MaxRotate int `json:"max_rotate"`
+		// QuotaCooldown 403 额度耗尽（insufficient quota）冷却；空 = "10m"。
+		QuotaCooldown string `json:"quota_cooldown"`
+		// RateCooldown 429 限流冷却；空 = "2m"。
+		RateCooldown string `json:"rate_cooldown"`
+		// ErrThreshold 连续错误熔断阈值；0 = 3。
+		ErrThreshold int `json:"err_threshold"`
+		// ErrCooldown 错误熔断冷却；空 = "5m"。
+		ErrCooldown string `json:"err_cooldown"`
+	} `json:"codearts"`
+
+	// OfficeAce 华为云果办渠道段：上游 OpenAI 兼容网关（Basic auth 不过期），
+	// 控制面临时 AK/SK 约 2 小时（refresh token 一次性轮换自动续）。
+	// 模型以 "officeace:" 前缀暴露。
+	OfficeAce struct {
+		Enabled bool `json:"enabled"`
+		// AuthDir 凭证目录（officeace-*.json）；空 = 跟随顶层 auth_dir。
+		AuthDir string `json:"auth_dir"`
+		// MaxRotate 单请求最多换号次数；0 = 3。
+		MaxRotate int `json:"max_rotate"`
+		// SoftCooldown 429/限流冷却；空 = "2m"。
+		SoftCooldown string `json:"soft_cooldown"`
+		// ErrThreshold 连续错误熔断阈值；0 = 3。
+		ErrThreshold int `json:"err_threshold"`
+		// ErrCooldown 错误熔断冷却；空 = "5m"。
+		ErrCooldown string `json:"err_cooldown"`
+	} `json:"officeace"`
+
+	// AutoClaw 智谱 autoglm 渠道段：X-Auth-Sign MD5 指纹 + X-Authorization 对话链 +
+	// refresh token 一次性轮换 + 双模型标识路由（X-Request-Model / body.model）。
+	// 模型以 "autoclaw:" 前缀暴露；登录用手机验证码（国内版）。
+	AutoClaw struct {
+		Enabled bool `json:"enabled"`
+		// AuthDir 凭证目录（autoclaw-*.json）；空 = 跟随顶层 auth_dir。
+		AuthDir string `json:"auth_dir"`
+		// MaxRotate 单请求最多换号次数；0 = 3。
+		MaxRotate int `json:"max_rotate"`
+		// SoftCooldown 429/限流冷却（上游无结构化恢复时间）；空 = "10m"。
+		SoftCooldown string `json:"soft_cooldown"`
+		// ErrThreshold 连续错误熔断阈值；0 = 3。
+		ErrThreshold int `json:"err_threshold"`
+		// ErrCooldown 错误熔断冷却；空 = "5m"。
+		ErrCooldown string `json:"err_cooldown"`
+	} `json:"autoclaw"`
+
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
@@ -283,11 +379,52 @@ type Config struct {
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
 	// Trae 段解析后的时长（NormalizeTrae 填充）。
-	TraeRefreshSkewDur    time.Duration `json:"-"`
-	TraePlanCooldownDur   time.Duration `json:"-"`
-	TraeSoftCooldownDur   time.Duration `json:"-"`
-	TraeErrCooldownDur    time.Duration `json:"-"`
-	TraeWorkMode          upstream.WorkMode `json:"-"` // 解析后的 Work 通道模式
+	TraeRefreshSkewDur  time.Duration     `json:"-"`
+	TraePlanCooldownDur time.Duration     `json:"-"`
+	TraeSoftCooldownDur time.Duration     `json:"-"`
+	TraeErrCooldownDur  time.Duration     `json:"-"`
+	TraeWorkMode        upstream.WorkMode `json:"-"` // 解析后的 Work 通道模式
+	// CosyDurs COSY 三渠道解析后的冷却时长（normalizeCosy 填充；key=渠道名）。
+	CosyDurs map[string]CosyDurations `json:"-"`
+
+	// HWDurs 华为云两渠道解析后的冷却时长（normalizeHW 填充；零值回落网关默认）。
+	HWDurs struct {
+		CodeArtsQuota time.Duration `json:"-"`
+		CodeArtsRate  time.Duration `json:"-"`
+		CodeArtsErr   time.Duration `json:"-"`
+		OfficeAceSoft time.Duration `json:"-"`
+		OfficeAceErr  time.Duration `json:"-"`
+		AutoClawSoft  time.Duration `json:"-"`
+		AutoClawErr   time.Duration `json:"-"`
+	} `json:"-"`
+}
+
+// CosyChannel COSY 协议族渠道共用配置段。
+type CosyChannel struct {
+	// Enabled 渠道总开关，缺省 true。无账号时渠道天然不服务，显式 false 是逃生门。
+	Enabled bool `json:"enabled"`
+	// AuthDir 凭证目录（qoder-*.json / qoderwork-*.json / qwenwork-*.json）；
+	// 空 = 跟随顶层 auth_dir（各渠道只 glob 各自前缀文件，与 workbuddy 凭证共存）。
+	AuthDir string `json:"auth_dir"`
+	// StateFile 账号池状态文件（积分/冷却缓存）；默认 ./data/<渠道名>_state.json。
+	StateFile string `json:"state_file"`
+	// MaxRotate 单请求最多换号次数；0 = 8。
+	MaxRotate int `json:"max_rotate"`
+	// HardCooldown 余额/日额度类硬冷却；空 = "12h"。
+	HardCooldown string `json:"hard_cooldown"`
+	// SoftCooldown 429/404/无权益软冷却；空 = "2m"。
+	SoftCooldown string `json:"soft_cooldown"`
+	// ErrThreshold 连续错误熔断阈值；0 = 3。
+	ErrThreshold int `json:"err_threshold"`
+	// ErrCooldown 错误熔断冷却；空 = "5m"。
+	ErrCooldown string `json:"err_cooldown"`
+	// DefaultModel model 缺省/"auto" 时的默认模型（各渠道口径不同）。
+	DefaultModel string `json:"default_model"`
+}
+
+// CosyDurations 渠道解析后的冷却时长。
+type CosyDurations struct {
+	Hard, Soft, Err time.Duration
 }
 
 // Default 默认配置。
@@ -324,6 +461,10 @@ func Default() *Config {
 	c.Schedule.BlackcatEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	// 跨渠道失败转移：新功能默认开（Enabled 是 *bool，nil 也按 true）。
+	// channel_fails<=0 在 failoverChannelFails() 回落 2。
+	c.Failover.ChannelFails = 2
+	// SkipOnCredit 留 nil：nil = 默认 false = 积分耗尽照常转移（各渠道额度独立）。
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -365,6 +506,19 @@ func Default() *Config {
 	c.Trae.DefaultModel = "glm-5.2"
 	c.Trae.WorkMode = "auto"
 	c.Trae.CreditResetDay = 1
+	// COSY 三渠道缺省：开关默认开（无账号即天然不服务）；默认模型按各渠道口径。
+	c.Qoder.Enabled = true
+	c.Qoder.DefaultModel = "Qwen3.7-Max"
+	c.QoderWork.Enabled = true
+	c.QoderWork.DefaultModel = "auto"
+	c.QwenWork.Enabled = true
+	c.QwenWork.DefaultModel = "flash"
+	// 华为云两渠道缺省：开关默认开（无账号即天然不服务）。
+	c.CodeArts.Enabled = true
+	c.CodeArts.CallbackPort = "18081"
+	c.OfficeAce.Enabled = true
+	// AutoClaw 缺省：开关默认开（无账号即天然不服务）。
+	c.AutoClaw.Enabled = true
 	return c
 }
 
@@ -667,7 +821,141 @@ func (c *Config) normalize() error {
 	if err := c.normalizePrompt(); err != nil {
 		return err
 	}
-	return c.normalizeTrae()
+	if err := c.normalizeTrae(); err != nil {
+		return err
+	}
+	if err := c.normalizeHW(); err != nil {
+		return err
+	}
+	return c.normalizeCosy()
+}
+
+// channelCheckinEnabled 渠道签到是否启用（nil = 老配置未给该键 → 按 true，
+// 新功能默认开，对升级用户零配置即生效）。
+func (c *Config) channelCheckinEnabled() bool {
+	return c.Schedule.ChannelCheckin.Enabled == nil || *c.Schedule.ChannelCheckin.Enabled
+}
+
+// channelCheckinExcluded 渠道名是否在排除名单里（大小写不敏感、去空白）。
+func (c *Config) channelCheckinExcluded(name string) bool {
+	for _, ex := range c.Schedule.ChannelCheckin.Exclude {
+		if strings.EqualFold(strings.TrimSpace(ex), name) {
+			return true
+		}
+	}
+	return false
+}
+
+// failoverEnabled 跨渠道失败转移是否启用（nil = 老配置未给键 → 按 true，
+// 新功能默认开）。
+func (c *Config) failoverEnabled() bool {
+	return c.Failover.Enabled == nil || *c.Failover.Enabled
+}
+
+// failoverChannelFails 单渠道连续失败切渠道阈值（<=0 回落 2）。
+func (c *Config) failoverChannelFails() int {
+	if c.Failover.ChannelFails <= 0 {
+		return 2
+	}
+	return c.Failover.ChannelFails
+}
+
+// failoverSkipOnCredit 积分耗尽时是否停止跨渠道转移（nil = 默认 true）。
+func (c *Config) failoverSkipOnCredit() bool {
+	return c.Failover.SkipOnCredit == nil || *c.Failover.SkipOnCredit
+}
+
+// normalizeHW 华为云两渠道段归一化：时长解析 fail fast，0 值回落网关默认。
+func (c *Config) normalizeHW() error {
+	if c.CodeArts.CallbackPort == "" {
+		c.CodeArts.CallbackPort = "18081"
+	}
+	if v := strings.TrimSpace(c.CodeArts.QuotaCooldown); v != "" {
+		dur, err := time.ParseDuration(v)
+		if err != nil || dur <= 0 {
+			return fmt.Errorf("codearts.quota_cooldown: %q 不是合法正时长", v)
+		}
+		c.HWDurs.CodeArtsQuota = dur
+	}
+	if v := strings.TrimSpace(c.CodeArts.RateCooldown); v != "" {
+		dur, err := time.ParseDuration(v)
+		if err != nil || dur <= 0 {
+			return fmt.Errorf("codearts.rate_cooldown: %q 不是合法正时长", v)
+		}
+		c.HWDurs.CodeArtsRate = dur
+	}
+	if v := strings.TrimSpace(c.CodeArts.ErrCooldown); v != "" {
+		dur, err := time.ParseDuration(v)
+		if err != nil || dur <= 0 {
+			return fmt.Errorf("codearts.err_cooldown: %q 不是合法正时长", v)
+		}
+		c.HWDurs.CodeArtsErr = dur
+	}
+	if v := strings.TrimSpace(c.OfficeAce.SoftCooldown); v != "" {
+		dur, err := time.ParseDuration(v)
+		if err != nil || dur <= 0 {
+			return fmt.Errorf("officeace.soft_cooldown: %q 不是合法正时长", v)
+		}
+		c.HWDurs.OfficeAceSoft = dur
+	}
+	if v := strings.TrimSpace(c.OfficeAce.ErrCooldown); v != "" {
+		dur, err := time.ParseDuration(v)
+		if err != nil || dur <= 0 {
+			return fmt.Errorf("officeace.err_cooldown: %q 不是合法正时长", v)
+		}
+		c.HWDurs.OfficeAceErr = dur
+	}
+	if v := strings.TrimSpace(c.AutoClaw.SoftCooldown); v != "" {
+		dur, err := time.ParseDuration(v)
+		if err != nil || dur <= 0 {
+			return fmt.Errorf("autoclaw.soft_cooldown: %q 不是合法正时长", v)
+		}
+		c.HWDurs.AutoClawSoft = dur
+	}
+	if v := strings.TrimSpace(c.AutoClaw.ErrCooldown); v != "" {
+		dur, err := time.ParseDuration(v)
+		if err != nil || dur <= 0 {
+			return fmt.Errorf("autoclaw.err_cooldown: %q 不是合法正时长", v)
+		}
+		c.HWDurs.AutoClawErr = dur
+	}
+	return nil
+}
+
+// normalizeCosy COSY 三渠道段归一化：时长解析 fail fast，0 值回落网关默认
+//（网关 New 对 MaxRotate/阈值/冷却有自己的缺省，这里只把非法字符串拦在启动前）。
+func (c *Config) normalizeCosy() error {
+	c.CosyDurs = map[string]CosyDurations{}
+	for name, ch := range map[string]*CosyChannel{
+		"qoder":     &c.Qoder,
+		"qoderwork": &c.QoderWork,
+		"qwenwork":  &c.QwenWork,
+	} {
+		d := CosyDurations{Hard: 12 * time.Hour, Soft: 2 * time.Minute, Err: 5 * time.Minute}
+		if v := strings.TrimSpace(ch.HardCooldown); v != "" {
+			dur, err := time.ParseDuration(v)
+			if err != nil || dur <= 0 {
+				return fmt.Errorf("%s.hard_cooldown: %q 不是合法正时长", name, ch.HardCooldown)
+			}
+			d.Hard = dur
+		}
+		if v := strings.TrimSpace(ch.SoftCooldown); v != "" {
+			dur, err := time.ParseDuration(v)
+			if err != nil || dur <= 0 {
+				return fmt.Errorf("%s.soft_cooldown: %q 不是合法正时长", name, ch.SoftCooldown)
+			}
+			d.Soft = dur
+		}
+		if v := strings.TrimSpace(ch.ErrCooldown); v != "" {
+			dur, err := time.ParseDuration(v)
+			if err != nil || dur <= 0 {
+				return fmt.Errorf("%s.err_cooldown: %q 不是合法正时长", name, ch.ErrCooldown)
+			}
+			d.Err = dur
+		}
+		c.CosyDurs[name] = d
+	}
+	return nil
 }
 
 // normalizeTrae trae 渠道段归一化：空值回落默认、时长解析 fail fast、

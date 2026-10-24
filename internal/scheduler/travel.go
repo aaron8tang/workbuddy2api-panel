@@ -41,12 +41,22 @@ func travelDay(t time.Time) string {
 	return t.In(cstZone).Format("2006-01-02")
 }
 
-// RunTravelNow 立即对池内所有可用账号执行一趟旅行巡检。
+// RunTravelNow 立即对池内所有可用账号执行一趟旅行巡检（面板手动入口，
+// 全局批量闸门互斥，忙时拒绝——2026-10-23 事故整改第二阶段）。
 // 禁用账号跳过；暂停选号（paused）账号照常参与——旅行是纯 RPC（状态/派出/
 // 领奖 + 领养前置上报），不发模型对话，与「让位防风控」不冲突；
 // 401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
 // 账号间限速 travelAccountDelay。
 func (s *Scheduler) RunTravelNow() {
+	if !s.tryAcquireBatch("手动旅行") {
+		return
+	}
+	defer s.batchMu.Unlock()
+	s.doTravel()
+}
+
+// doTravel 旅行遍历本体（调用方必须已持有 batchMu）：定时槽走 runBatch→本函数。
+func (s *Scheduler) doTravel() {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {

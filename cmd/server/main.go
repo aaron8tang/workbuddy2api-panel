@@ -18,10 +18,17 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/autoclaw"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/codearts"
+	cosypool "github.com/linguo2625469/workbuddy2api-panel/internal/cosy"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelgroup"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/officeace"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qoder"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qoderwork"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qwenwork"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -38,6 +45,121 @@ import (
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 const appVersion = "1.13.0-panel"
 
+// buildChannelCheckinHooks 装配渠道签到钩子表：把各渠道的每日动作（签到/领奖励/
+// 福利池）挂到主签到时点上一起执行。
+//
+// 各渠道网关 nil（渠道未启用）或渠道名在 schedule.channel_checkin.exclude 里 →
+// 不挂该渠道；schedule.channel_checkin.enabled=false（或缺省，指针 nil 视为 true）
+// → 整表为空（只签主账号池，老行为）。
+func buildChannelCheckinHooks(cfg *Config,
+	traeSched *traescheduler.Scheduler,
+	qoderworkGw *qoderwork.Gateway,
+	codeartsGw *codearts.Gateway,
+	officeaceGw *officeace.Gateway,
+	autoclawGw *autoclaw.Gateway,
+) []scheduler.ChannelCheckinHook {
+	if !cfg.channelCheckinEnabled() {
+		return nil
+	}
+	var hooks []scheduler.ChannelCheckinHook
+	add := func(name string, run func() []string) {
+		if cfg.channelCheckinExcluded(name) {
+			log.Printf("[checkin] 渠道 %s 在 channel_checkin.exclude 里，跳过", name)
+			return
+		}
+		hooks = append(hooks, scheduler.ChannelCheckinHook{Name: name, Run: run})
+	}
+	// trae：走它自己的调度器（与面板「立即签到」按钮同路径，含 9074 退避重试闭环）。
+	if traeSched != nil {
+		add("trae", func() []string {
+			traeSched.RunCheckinNow()
+			return []string{"已触发（trae 调度器内部记账，结果见 trae 日志）"}
+		})
+	}
+	// qoderwork：sash campaigns 签到（每账号一行）。
+	if qoderworkGw != nil {
+		add("qoderwork", func() []string {
+			var lines []string
+			for _, r := range qoderworkGw.CheckinAll() {
+				status := "成功"
+				switch {
+				case r.Already:
+					status = "已领过"
+				case r.NoClaim:
+					status = "无活动"
+				case !r.OK:
+					status = "失败"
+				}
+				lines = append(lines, fmt.Sprintf("%s: %s%s", r.UID, status, msgSuffix(r.Msg)))
+			}
+			return lines
+		})
+	}
+	// codearts：福利池档案注册/领取（幂等）。
+	if codeartsGw != nil {
+		add("codearts", func() []string {
+			var lines []string
+			for _, r := range codeartsGw.CheckinAll() {
+				status := "失败"
+				if r.OK {
+					status = "OK"
+				}
+				lines = append(lines, fmt.Sprintf("%s: %s%s", r.UID, status, msgSuffix(r.Msg)))
+			}
+			return lines
+		})
+	}
+	// officeace：订阅奖励领取（幂等，按天）。
+	if officeaceGw != nil {
+		add("officeace", func() []string {
+			var lines []string
+			for _, r := range officeaceGw.CheckinAll() {
+				status := "失败"
+				if r.OK {
+					status = "OK"
+				}
+				lines = append(lines, fmt.Sprintf("%s: %s%s", r.UID, status, msgSuffix(r.Msg)))
+			}
+			return lines
+		})
+	}
+	// autoclaw：签到 + 活动福利触发（user-info 是唯一入账动作）。
+	if autoclawGw != nil {
+		add("autoclaw", func() []string {
+			results, anyOK := autoclawGw.CheckinAll()
+			var lines []string
+			for _, r := range results {
+				status := "失败"
+				switch {
+				case r.OK:
+					status = "成功"
+				case r.Already:
+					status = "已签过"
+				}
+				lines = append(lines, fmt.Sprintf("%s: %s%s", r.UID, status, msgSuffix(r.Msg)))
+			}
+			_ = anyOK
+			return lines
+		})
+	}
+	if len(hooks) > 0 {
+		names := make([]string, 0, len(hooks))
+		for _, h := range hooks {
+			names = append(names, h.Name)
+		}
+		log.Printf("[checkin] 渠道自动签到已启用：%v", names)
+	}
+	return hooks
+}
+
+// msgSuffix 结果摘要里的补充说明（空则不加）。
+func msgSuffix(msg string) string {
+	if msg == "" {
+		return ""
+	}
+	return "（" + msg + "）"
+}
+
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
 func usagePathFor(stateFile string) string { return stateSibling(stateFile, "usage.json") }
@@ -50,6 +172,16 @@ func stateSibling(stateFile, name string) string {
 		return name
 	}
 	return filepath.Join(dir, name)
+}
+
+// logCosyBoot COSY 渠道启动日志（有账号带条数，无账号提示导入路径）。
+func logCosyBoot(name, dir string, accounts int) {
+	if accounts == 0 {
+		log.Printf("[%s] 渠道已启用但暂无账号（%s 下无 %s-*.json）：面板导入后即生效",
+			name, dir, name)
+		return
+	}
+	log.Printf("[%s] 渠道已启用：%d 个账号（模型以 %s: 前缀暴露）", name, accounts, name)
 }
 
 func main() {
@@ -108,7 +240,8 @@ func main() {
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
-	p.SetAccountOrder(cfg.Pool.AccountOrder)             // 手工使用顺序（空 = 自动加权）
+	p.SetExpiringSoonWindow(cfg.ExpiringSoonDur) // 快过期窗口：路由 pkgs 信号与 scheduler 快照同源
+	p.SetAccountOrder(cfg.Pool.AccountOrder)     // 手工使用顺序（空 = 自动加权）
 
 	// redisstore 模式观测（"upstash" / "noop"，供 /status 透出）。
 	// 会话粘性已整体移除：prompt_cache_key 统一后同会话跨账号/跨池 cache key 恒定，
@@ -217,6 +350,155 @@ func main() {
 		}
 	}
 
+	// ---------------------------------------------------------------------------
+	// COSY 协议族三渠道（qoder / qoderwork / qwenwork）：独立账号池 + 凭证目录，
+	// 主路由按 "qoder:"/"qoderwork:"/"qwenwork:" 前缀分发。Enabled=false 或无账号
+	// 时不参与服务（Servable=false、models 不追加条目、handler/panel 对应门面 nil）。
+	// 签名/编码/SSE 底座在 internal/cosy；凭据格式：
+	//   qoder     qoder-<uid>.json     （API-Console 口径：OAuth 设备流 + 持久运行时字段）
+	//   qoderwork qoderwork-<uid>.json （qoderwork2api 口径：dt/drt + 每请求会话）
+	//   qwenwork  qwenwork-<uid>.json  （千问办公桌面端解密 auth-v2.dat 口径）
+	// ---------------------------------------------------------------------------
+	var qoderGw *qoder.Gateway
+	var qoderworkGw *qoderwork.Gateway
+	var qwenworkGw *qwenwork.Gateway
+	var codeartsGw *codearts.Gateway
+	var officeaceGw *officeace.Gateway
+	var autoclawGw *autoclaw.Gateway
+	if cfg.Qoder.Enabled {
+		dir := cfg.Qoder.AuthDir
+		if dir == "" {
+			dir = cfg.AuthDir
+		}
+		state := cfg.Qoder.StateFile
+		if state == "" {
+			state = stateSibling(cfg.StateFile, "qoder_state.json")
+		}
+		cp := cosypool.NewPool(state)
+		durs := cfg.CosyDurs["qoder"]
+		qoderGw = qoder.New(qoder.Config{
+			Pool: cp, Upstream: qoder.NewClient(), AuthDir: dir,
+			MaxRotate: cfg.Qoder.MaxRotate, HardCooldown: durs.Hard,
+			SoftCooldown: durs.Soft, ErrThreshold: cfg.Qoder.ErrThreshold,
+			ErrCooldown: durs.Err, DefaultModel: cfg.Qoder.DefaultModel,
+		})
+		logCosyBoot("qoder", dir, len(qoderGw.Pool().List()))
+	}
+	if cfg.QoderWork.Enabled {
+		dir := cfg.QoderWork.AuthDir
+		if dir == "" {
+			dir = cfg.AuthDir
+		}
+		state := cfg.QoderWork.StateFile
+		if state == "" {
+			state = stateSibling(cfg.StateFile, "qoderwork_state.json")
+		}
+		cp := cosypool.NewPool(state)
+		durs := cfg.CosyDurs["qoderwork"]
+		qoderworkGw = qoderwork.New(qoderwork.Config{
+			Pool: cp, Upstream: qoderwork.NewClient(), AuthDir: dir,
+			MaxRotate: cfg.QoderWork.MaxRotate, HardCooldown: durs.Hard,
+			SoftCooldown: durs.Soft, ErrThreshold: cfg.QoderWork.ErrThreshold,
+			ErrCooldown: durs.Err, DefaultModel: cfg.QoderWork.DefaultModel,
+		})
+		logCosyBoot("qoderwork", dir, len(qoderworkGw.Pool().List()))
+	}
+	if cfg.QwenWork.Enabled {
+		dir := cfg.QwenWork.AuthDir
+		if dir == "" {
+			dir = cfg.AuthDir
+		}
+		state := cfg.QwenWork.StateFile
+		if state == "" {
+			state = stateSibling(cfg.StateFile, "qwenwork_state.json")
+		}
+		cp := cosypool.NewPool(state)
+		durs := cfg.CosyDurs["qwenwork"]
+		qwenworkGw = qwenwork.New(qwenwork.Config{
+			Pool: cp, Upstream: qwenwork.NewClient(), AuthDir: dir,
+			MaxRotate: cfg.QwenWork.MaxRotate, HardCooldown: durs.Hard,
+			SoftCooldown: durs.Soft, ErrThreshold: cfg.QwenWork.ErrThreshold,
+			ErrCooldown: durs.Err, DefaultModel: cfg.QwenWork.DefaultModel,
+		})
+		logCosyBoot("qwenwork", dir, len(qwenworkGw.Pool().List()))
+	}
+
+	// ---------------------------------------------------------------------------
+	// 华为云两渠道（codearts / officeace）：独立凭证目录，主路由按
+	// "codearts:"/"officeace:" 前缀分发。Enabled=false 或无账号时不参与服务
+	//（Servable=false、models 不追加条目、handler/panel 对应门面 nil）。
+	// 凭据格式：codearts-<uid>.json（STS 三元组 + refresh token + PKCE/DPoP 上下文）、
+	// officeace-<uid>.json（网关 Basic 对 + 控制面临时凭据 + refresh token + DPoP）。
+	// ---------------------------------------------------------------------------
+	if cfg.CodeArts.Enabled {
+		dir := cfg.CodeArts.AuthDir
+		if dir == "" {
+			dir = cfg.AuthDir
+		}
+		codeartsGw = codearts.New(codearts.Config{
+			AuthDir:       dir,
+			MaxRotate:     cfg.CodeArts.MaxRotate,
+			CallbackPort:  cfg.CodeArts.CallbackPort,
+			ErrThreshold:  cfg.CodeArts.ErrThreshold,
+			ErrCooldown:   cfg.HWDurs.CodeArtsErr,
+			QuotaCooldown: cfg.HWDurs.CodeArtsQuota,
+			RateCooldown:  cfg.HWDurs.CodeArtsRate,
+		})
+		codeartsGw.StartCallbackServer(cfg.CodeArts.CallbackPort)
+		switch {
+		case cfg.CodeArts.CallbackPort == "" || cfg.CodeArts.CallbackPort == "0":
+			log.Printf("[codearts] 渠道已启用（Web 登录回调未启动）：面板可粘贴凭证 JSON 导入")
+		case !codeartsGw.HasAccounts():
+			log.Printf("[codearts] 渠道已启用但暂无账号（%s 下无 codearts-*.json）：面板 Web 登录/导入后即生效", dir)
+		default:
+			log.Printf("[codearts] 渠道已启用：%d 个账号（模型以 codearts: 前缀暴露，回调监听 :%s）",
+				len(codeartsGw.PoolRef().UIDs()), cfg.CodeArts.CallbackPort)
+		}
+	}
+	if cfg.OfficeAce.Enabled {
+		dir := cfg.OfficeAce.AuthDir
+		if dir == "" {
+			dir = cfg.AuthDir
+		}
+		officeaceGw = officeace.New(officeace.Config{
+			AuthDir:      dir,
+			MaxRotate:    cfg.OfficeAce.MaxRotate,
+			SoftCooldown: cfg.HWDurs.OfficeAceSoft,
+			ErrThreshold: cfg.OfficeAce.ErrThreshold,
+			ErrCooldown:  cfg.HWDurs.OfficeAceErr,
+		})
+		if !officeaceGw.HasAccounts() {
+			log.Printf("[officeace] 渠道已启用但暂无账号（%s 下无 officeace-*.json）：面板 Web 登录/导入后即生效", dir)
+		} else {
+			log.Printf("[officeace] 渠道已启用：%d 个账号（模型以 officeace: 前缀暴露）", len(officeaceGw.List()))
+		}
+	}
+	// ---------------------------------------------------------------------------
+	// AutoClaw 渠道（智谱 autoglm）：独立凭证目录 autoclaw-*.json，主路由按
+	// "autoclaw:" 前缀分发。Enabled=false 或无账号时不参与服务（零回归）。
+	// 登录：手机验证码（面板两步 send-code → verify）；凭证也可直接粘贴明文 JWT
+	// / enc: safeStorage 密文 / 桌面端 auth.json 整包。
+	// ---------------------------------------------------------------------------
+	if cfg.AutoClaw.Enabled {
+		dir := cfg.AutoClaw.AuthDir
+		if dir == "" {
+			dir = cfg.AuthDir
+		}
+		autoclawGw = autoclaw.New(autoclaw.Config{
+			Region:       autoclaw.RegionCN,
+			AuthDir:      dir,
+			MaxRotate:    cfg.AutoClaw.MaxRotate,
+			SoftCooldown: cfg.HWDurs.AutoClawSoft,
+			ErrThreshold: cfg.AutoClaw.ErrThreshold,
+			ErrCooldown:  cfg.HWDurs.AutoClawErr,
+		})
+		if !autoclawGw.HasAccounts() {
+			log.Printf("[autoclaw] 渠道已启用但暂无账号（%s 下无 autoclaw-*.json）：面板手机验证码登录/导入后即生效", dir)
+		} else {
+			log.Printf("[autoclaw] 渠道已启用：%d 个账号（模型以 autoclaw: 前缀暴露）", len(autoclawGw.List()))
+		}
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
@@ -321,21 +603,30 @@ func main() {
 	}
 
 	pn := panel.New(panel.Config{
-		Pool:        p,
-		Usage:       rec,
-		RequestLog:  requestLog,
-		Upstream:    up,
-		Scheduler:   sch,
-		AuthDir:     cfg.AuthDir,
-		APIKey:      cfg.APIKey,
-		RedisMode:   redisMode,
-		Version:     appVersion,
-		Live:        live,
+		Pool:       p,
+		Usage:      rec,
+		RequestLog: requestLog,
+		Upstream:   up,
+		Scheduler:  sch,
+		AuthDir:    cfg.AuthDir,
+		APIKey:     cfg.APIKey,
+		RedisMode:  redisMode,
+		Version:    appVersion,
+		Live:       live,
 		// 模型组注册表：面板「模型与档位 → 模型组」在线编辑后经 SaveConfig 热替换
 		//（路由 pattern 是通配 {group} 段，组存在性在请求期查表，无需重启）。
 		ModelGroups: mgr,
 		// trae 渠道门面（nil = 渠道关闭：/panel/api/trae/* 不注册）。
 		Trae: traeGw,
+		// COSY 协议族三渠道门面（nil = 渠道关闭：对应 /panel/api/* 不注册）。
+		Qoder:     qoderGw,
+		QoderWork: qoderworkGw,
+		QwenWork:  qwenworkGw,
+		// 华为云两渠道门面（nil = 渠道关闭）。
+		CodeArts:  codeartsGw,
+		OfficeAce: officeaceGw,
+		// AutoClaw 门面（nil = 渠道关闭）。
+		AutoClaw: autoclawGw,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -374,7 +665,32 @@ func main() {
 		ModelGroups: mgr,
 		// trae 渠道门面（nil = 渠道关闭：trae: 模型前缀恒 404，零回归）。
 		Trae: traeGw,
+		// COSY 协议族三渠道门面（nil = 渠道关闭：前缀恒 404，零回归）。
+		Qoder:     qoderGw,
+		QoderWork: qoderworkGw,
+		QwenWork:  qwenworkGw,
+		// 华为云两渠道门面（nil = 渠道关闭：前缀恒 404，零回归）。
+		CodeArts:  codeartsGw,
+		OfficeAce: officeaceGw,
+		// AutoClaw 门面（nil = 渠道关闭：前缀恒 404，零回归）。
+		AutoClaw: autoclawGw,
 	})
+	// 跨渠道失败转移：单渠道连续失败后把请求交给下一个渠道，而不是把错误透传
+	// 给客户端（默认开启；config.failover 可关）。
+	if cfg.failoverEnabled() {
+		h.SetFailover(server.FailoverConfig{
+			Enabled:      true,
+			ChannelFails: cfg.failoverChannelFails(),
+			SkipOnCredit: cfg.failoverSkipOnCredit(),
+			MaxChannels:  cfg.Failover.MaxChannels,
+		})
+		log.Printf("跨渠道失败转移已启用：连续 %d 次失败切渠道（max_channels=%d, skip_on_credit=%v）",
+			cfg.failoverChannelFails(), cfg.Failover.MaxChannels, cfg.failoverSkipOnCredit())
+	}
+
+	// 渠道自动签到：把各渠道的每日动作挂到主签到时点上一起跑（网关 nil = 渠道关闭
+	// = 不挂；schedule.channel_checkin.enabled=false 或渠道在 exclude 名单里也跳过）。
+	sch.SetChannelCheckinHooks(buildChannelCheckinHooks(cfg, traeSched, qoderworkGw, codeartsGw, officeaceGw, autoclawGw))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -574,7 +890,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
-	p.SetAccountOrder(newCfg.Pool.AccountOrder) // 手工使用顺序热生效（面板账号池 ↑↓）
+	p.SetExpiringSoonWindow(newCfg.ExpiringSoonDur) // 快过期窗口热生效（路由 pkgs 信号同步）
+	p.SetAccountOrder(newCfg.Pool.AccountOrder)     // 手工使用顺序热生效（面板账号池 ↑↓）
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
@@ -623,6 +940,26 @@ func restartRequiredFields(c *Config) []string {
 		"trae.plan_cooldown", "trae.soft_cooldown", "trae.err_threshold", "trae.err_cooldown",
 		"trae.default_model", "trae.work_mode", "trae.work_bridge_url", "trae.work_bridge_token",
 		"trae.credit_reset_day", "trae.user_agent")
+	// COSY 三渠道同 trae 口径：池/网关都是装配期对象，改动需重启。
+	for _, name := range []string{"qoder", "qoderwork", "qwenwork"} {
+		out = append(out, name+".enabled", name+".auth_dir", name+".state_file",
+			name+".max_rotate", name+".hard_cooldown", name+".soft_cooldown",
+			name+".err_threshold", name+".err_cooldown", name+".default_model")
+	}
+	// 华为云两渠道同 trae 口径：池/网关/回调监听都是装配期对象，改动需重启。
+	out = append(out, "codearts.enabled", "codearts.auth_dir", "codearts.callback_port",
+		"codearts.max_rotate", "codearts.quota_cooldown", "codearts.rate_cooldown",
+		"codearts.err_threshold", "codearts.err_cooldown",
+		"officeace.enabled", "officeace.auth_dir", "officeace.max_rotate",
+		"officeace.soft_cooldown", "officeace.err_threshold", "officeace.err_cooldown")
+	// AutoClaw 同 trae 口径：网关是装配期对象（含每小时强制刷新后台任务），改动需重启。
+	out = append(out, "autoclaw.enabled", "autoclaw.auth_dir", "autoclaw.max_rotate",
+		"autoclaw.soft_cooldown", "autoclaw.err_threshold", "autoclaw.err_cooldown")
+	// 渠道自动签到钩子是装配期挂载的（网关对象在启动时注入 scheduler），改动需重启。
+	out = append(out, "schedule.channel_checkin.enabled", "schedule.channel_checkin.exclude")
+	// 跨渠道失败转移配置同样是装配期注入 handler 的（SetFailover），改动需重启。
+	out = append(out, "failover.enabled", "failover.exclude",
+		"failover.channel_fails", "failover.max_channels", "failover.skip_on_credit")
 	return out
 }
 

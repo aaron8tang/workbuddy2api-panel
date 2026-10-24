@@ -16,6 +16,7 @@ if "%IMAGE%"=="" set "IMAGE=workbuddy2api-panel:local"
 set "NAME=workbuddy2api"
 set "PORT=7863"
 set "CBPORT=18080"
+set "CBPORT2=18081"
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
@@ -90,10 +91,13 @@ rem ---------- subroutines ----------
 rem %1 = image name
 rem 18080 = trae channel web-login callback (/authorize): TRAE login page redirects
 rem to host 127.0.0.1:18080, port-mapped into the container (binds :18080 on all
-rem interfaces inside). Keep in sync with docker-compose.yml ports (this script
-rem uses plain docker run, not compose). NOTE: keep comments ASCII-only - cmd
-rem parses this file in the OEM codepage and UTF-8 Chinese here breaks parsing.
-docker run -d --name %NAME% -p %PORT%:%PORT% -p %CBPORT%:%CBPORT% -e TZ=Asia/Shanghai ^
+rem interfaces inside). 18081 = codearts channel web-login callback (/oauth/callback):
+rem the CodeArts portal redirects to host 127.0.0.1:18081 (only the port is ours,
+rem the path is fixed by the portal). Keep in sync with docker-compose.yml ports
+rem (this script uses plain docker run, not compose).
+rem NOTE: keep comments ASCII-only - cmd parses this file in the OEM codepage and
+rem UTF-8 Chinese here breaks parsing.
+docker run -d --name %NAME% -p %PORT%:%PORT% -p %CBPORT%:%CBPORT% -p %CBPORT2%:%CBPORT2% -e TZ=Asia/Shanghai ^
   -v "%ROOT%\auths:/app/auths" ^
   -v "%ROOT%\data:/app/data" ^
   -v "%ROOT%\config.json:/app/config.json" ^

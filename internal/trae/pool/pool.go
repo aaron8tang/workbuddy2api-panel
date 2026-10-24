@@ -129,30 +129,24 @@ func (e *entry) healthyWork(now time.Time) bool {
 	return true
 }
 
-// expiring24h 统计 24h 窗口内到期作废的积分合计与最早到期时刻（Unix 秒）。
-// 口径与 gateway.Accounts() 的 Exp24h 列完全一致（自然日天粒度：到期日=今天或
-// 明天，d∈{0,1}），避免面板展示与选号行为出现两套标准。无明细快照或窗口内
-// 无到期返回 (0, 0)。选号临期硬偏好的判定数据源。
-func (e *entry) expiring24h(now time.Time) (float64, int64) {
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	var sum float64
+// earliestPackExpiry 返回全量未到期权益包的最早失效时刻（Unix 秒，0=无未来批次）。
+// 选号 FEFO 排序键：不再受 24h 天粒度窗口限制——某批次积分的具体到期时分秒
+// （签到 100/150 积分包的 expire_time，上游按 DeductionEnd 精确到秒下发）就是
+// 最真实的紧迫度，「谁先失效先用谁」按全量批次比较。已过期（ExpireAt <= now）
+// 的陈旧包跳过：积分已作废，不参与未来紧迫度排序；Remain<=0 的包（上游拉取
+// 清洗 / 内存 FEFO 扣穿后剔除）同理跳过。
+func (e *entry) earliestPackExpiry(now time.Time) int64 {
+	nowUnix := now.Unix()
 	var earliest int64
 	for _, pk := range e.creditPacks {
-		if pk.ExpireAt <= 0 || pk.Remain <= 0 {
+		if pk.ExpireAt <= nowUnix || pk.Remain <= 0 {
 			continue
 		}
-		exp := time.Unix(pk.ExpireAt, 0)
-		expDay := time.Date(exp.Year(), exp.Month(), exp.Day(), 0, 0, 0, 0, now.Location())
-		d := int(expDay.Sub(today).Hours() / 24)
-		if d < 0 || d > 1 {
-			continue
-		}
-		sum += pk.Remain
 		if earliest == 0 || pk.ExpireAt < earliest {
 			earliest = pk.ExpireAt
 		}
 	}
-	return sum, earliest
+	return earliest
 }
 
 // stateEntry state.json 单账号持久化条目。
@@ -340,7 +334,9 @@ func (p *Pool) Pick() *auth.Auth {
 	return p.PickExcluding(nil)
 }
 
-const minPickGap = 100 * time.Millisecond
+// minPickGap 防并发撞号窗口：同一账号在该窗口内不重复被选中（除非候选全部刚被
+// 用过，LRU 兜底）。var 而非 const：测试用 withNoPickGap 置 0（与主池同约定）。
+var minPickGap = 100 * time.Millisecond
 
 // weightOf 计算三因子调度权重：
 // 1. credits 占比 × 10
@@ -374,9 +370,10 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 // 未排序账号垫底，且候选名单截 1——顺序第一名不可用（冷却/在途满/不健康）时
 // 根本进不了候选，自然轮到下一名；此时临期硬偏好整体让位（手工顺序压过临期，
 // 与主池粘性分配路径 realm.go 同约定：用户手工拖到第一位的远期号必须可被选中）。
-// 自动模式下候选中存在 24h 窗口内到期积分的账号时，收敛候选集到这些账号（硬偏好，
-// 「先用掉要过期的积分」，积分最高但远期到期的账号中签率为 0），排序次键为
-// FEFO（最早到期时刻升序，谁先到期先用谁）。无临期账号时与既有三因子行为完全一致。
+// 自动模式下候选中存在未来批次积分的账号时（earliestPackExpiry>0），收敛候选集
+// 到这些账号（硬偏好，「先用掉要过期的积分」，积分最高但远期到期的账号中签率为
+// 0），排序次键为 FEFO（全量未到期包最早失效时刻升序，精确到时分秒，谁先到期
+// 先用谁）。全员无未来批次时与既有三因子行为完全一致。
 func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *entry {
 	var cands []*entry
 	for uid, e := range p.byUID {
@@ -408,7 +405,7 @@ func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *en
 
 	type cand struct {
 		e    *entry
-		fefe int64 // 24h 窗口内最早到期时刻（Unix 秒，0=无临期积分）
+		fefe int64 // 全量未到期权益包的最早失效时刻（Unix 秒，0=无未来批次）
 	}
 	cs := make([]cand, 0, len(cands))
 	nExpiring := 0
@@ -417,7 +414,7 @@ func (p *Pool) pickBestCandidateLocked(tried map[string]bool, now time.Time) *en
 		if e.orderRank > 0 {
 			manualOrder = true
 		}
-		_, earliest := e.expiring24h(now)
+		earliest := e.earliestPackExpiry(now)
 		if earliest > 0 {
 			nExpiring++
 		}

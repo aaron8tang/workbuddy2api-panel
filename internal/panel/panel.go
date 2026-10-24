@@ -22,12 +22,19 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/autoclaw"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/codearts"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/officeace"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelgroup"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qoder"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qoderwork"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/qwenwork"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/stagger"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -52,6 +59,18 @@ type Config struct {
 
 	// Trae trae 渠道门面（阶段 2b 合并；nil = 渠道未启用，不注册 /panel/api/trae/* 端点）。
 	Trae *trae.Gateway
+
+	// COSY 协议族三渠道门面（nil = 渠道未启用，不注册对应 /panel/api/* 端点）。
+	Qoder     *qoder.Gateway
+	QoderWork *qoderwork.Gateway
+	QwenWork  *qwenwork.Gateway
+
+	// 华为云两渠道门面（nil = 渠道未启用，不注册对应 /panel/api/* 端点）。
+	CodeArts  *codearts.Gateway
+	OfficeAce *officeace.Gateway
+
+	// AutoClaw 门面（nil = 渠道未启用，不注册对应 /panel/api/* 端点）。
+	AutoClaw *autoclaw.Gateway
 
 	// ConfigPath config.json 路径与加载器（配置页读写用）。
 	// LoadConfig 返回解析后的配置对象（前端展示/校验用，具体类型由 main 注入的闭包决定）；
@@ -195,6 +214,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.traeRoutes() // trae 渠道端点（Trae==nil 时为空操作）
+	p.cosyRoutes() // COSY 协议族三渠道端点（各网关 nil 时为空操作）
+	p.hwRoutes()   // 华为云两渠道端点（各网关 nil 时为空操作）
+	p.acRoutes()   // AutoClaw 渠道端点（网关 nil 时为空操作）
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -365,6 +387,33 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	// 模型组 chips 可直接点选 trae 模型进组（组白名单按裸名判等，天然兼容）。
 	if p.cfg.Trae != nil && p.cfg.Trae.HasAccounts() {
 		out = append(out, p.cfg.Trae.ModelEntries()...)
+	}
+
+	// COSY 协议族三渠道：同 trae 口径（有账号才透出，与 /v1/models 的 modelList
+	// 一致）。条目 id 带 qoder:/qoderwork:/qwenwork: 前缀，前端按前缀筛选/点选，
+	// 模型组 chips 可直接点选进组（组白名单按裸名判等，天然兼容）。
+	if p.cfg.Qoder != nil && p.cfg.Qoder.HasAccounts() {
+		out = append(out, p.cfg.Qoder.ModelEntries()...)
+	}
+	if p.cfg.QoderWork != nil && p.cfg.QoderWork.HasAccounts() {
+		out = append(out, p.cfg.QoderWork.ModelEntries()...)
+	}
+	if p.cfg.QwenWork != nil && p.cfg.QwenWork.HasAccounts() {
+		out = append(out, p.cfg.QwenWork.ModelEntries()...)
+	}
+
+	// 华为云两渠道：同 trae/COSY 口径（有账号才透出）。条目 id 带
+	// codearts:/officeace: 前缀，模型组 chips 可直接点选进组。
+	if p.cfg.CodeArts != nil && p.cfg.CodeArts.HasAccounts() {
+		out = append(out, p.cfg.CodeArts.ModelEntries()...)
+	}
+	if p.cfg.OfficeAce != nil && p.cfg.OfficeAce.HasAccounts() {
+		out = append(out, p.cfg.OfficeAce.ModelEntries()...)
+	}
+	// AutoClaw：同 trae/COSY/华为云口径（有账号才透出）。条目 id 带 autoclaw: 前缀，
+	// 模型组 chips 可直接点选进组。
+	if p.cfg.AutoClaw != nil && p.cfg.AutoClaw.HasAccounts() {
+		out = append(out, p.cfg.AutoClaw.ModelEntries()...)
 	}
 
 	if len(out) == 0 {
@@ -664,7 +713,12 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	p.cfg.Scheduler.RunBalanceRefreshNow()
+	if !p.cfg.Scheduler.RunBalanceRefreshNow() {
+		// 全局批量闸门忙（签到/旅行/保活等批量任务执行中）：拒绝本次刷新，
+		// 避免「手动余额刷新 × 定时批量」同窗口交叉打同一批账号。
+		writeErr(w, http.StatusConflict, "批量任务执行中，请稍后再试")
+		return
+	}
 	p.syncNicknames()
 	log.Printf("panel: 手动全量余额刷新完成")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
@@ -692,34 +746,19 @@ func (p *Panel) syncNicknames() {
 	if len(jobs) == 0 {
 		return
 	}
-	var (
-		mu      sync.Mutex
-		updated int
-		failed  int
-		sem     = make(chan struct{}, 3)
-		wg      sync.WaitGroup
-	)
+	// 串行 + 账号间随机错峰（2026-10-23 事故整改）：同渠道多账号绝不并发扇出。
+	var updated, failed int
 	for _, j := range jobs {
-		wg.Add(1)
-		go func(j job) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			nick, err := p.cfg.Upstream.FetchAccountProfile(j.a)
-			if err != nil {
-				mu.Lock()
-				failed++
-				mu.Unlock()
-				return
-			}
-			if p.cfg.Pool.SetNickname(j.uid, nick) {
-				mu.Lock()
-				updated++
-				mu.Unlock()
-			}
-		}(j)
+		time.Sleep(stagger.Light())
+		nick, err := p.cfg.Upstream.FetchAccountProfile(j.a)
+		if err != nil {
+			failed++
+			continue
+		}
+		if p.cfg.Pool.SetNickname(j.uid, nick) {
+			updated++
+		}
 	}
-	wg.Wait()
 	if updated > 0 || failed > 0 {
 		log.Printf("panel: 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)
 	}
@@ -808,8 +847,9 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 
 // packages 返回全部账号的积分包构成，供「积分构成」视图对比。
 //
-// 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
-// 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
+// 逐个账号向上游查（串行 + 账号间随机错峰，2026-10-23 事故整改：并发扇出是
+// 机器人指纹），失败只在对应账号上标 error，不影响其它账号——一个号 token 失效
+// 不该让整页空白。
 func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	accts := p.cfg.Pool.List()
 	type row struct {
@@ -823,35 +863,29 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]row, len(accts))
 
-	sem := make(chan struct{}, 3)
-	var wg sync.WaitGroup
 	for i, s := range accts {
-		wg.Add(1)
-		go func(i int, s pool.Status) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
-			a := p.cfg.Pool.AuthByUID(s.UID)
-			if a == nil {
-				it.Error = "account not loaded"
-				out[i] = it
-				return
-			}
-			packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
-			if err != nil {
-				it.Error = err.Error()
-				out[i] = it
-				return
-			}
-			it.Packages = packs
-			it.Remain = remain
-			it.Size = size
+		it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+		a := p.cfg.Pool.AuthByUID(s.UID)
+		if a == nil {
+			it.Error = "account not loaded"
 			out[i] = it
-		}(i, s)
+			continue
+		}
+		// 账号间随机错峰（轻查询档）。
+		if i > 0 {
+			time.Sleep(stagger.Light())
+		}
+		packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
+		if err != nil {
+			it.Error = err.Error()
+			out[i] = it
+			continue
+		}
+		it.Packages = packs
+		it.Remain = remain
+		it.Size = size
+		out[i] = it
 	}
-	wg.Wait()
 
 	// 余额降序：多的在前，便于和少的对比。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })

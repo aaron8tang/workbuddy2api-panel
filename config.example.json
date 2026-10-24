@@ -34,7 +34,17 @@
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
-    "include_disabled_in_tasks": false
+    "include_disabled_in_tasks": false,
+    "channel_checkin": {
+      "enabled": true,
+      "exclude": []
+    }
+  },
+  "failover": {
+    "enabled": true,
+    "channel_fails": 2,
+    "skip_on_credit": false,
+    "max_channels": 0
   },
   "global": {
     "enabled": true,
@@ -107,5 +117,31 @@
     "work_bridge_url": "",
     "work_bridge_token": "",
     "credit_reset_day": 1
+  },
+  "codearts": {
+    "enabled": true,
+    "auth_dir": "",
+    "callback_port": "18081",
+    "max_rotate": 3,
+    "quota_cooldown": "10m",
+    "rate_cooldown": "2m",
+    "err_threshold": 3,
+    "err_cooldown": "5m"
+  },
+  "officeace": {
+    "enabled": true,
+    "auth_dir": "",
+    "max_rotate": 3,
+    "soft_cooldown": "2m",
+    "err_threshold": 3,
+    "err_cooldown": "5m"
+  },
+  "autoclaw": {
+    "enabled": true,
+    "auth_dir": "",
+    "max_rotate": 3,
+    "soft_cooldown": "10m",
+    "err_threshold": 3,
+    "err_cooldown": "5m"
   }
 }

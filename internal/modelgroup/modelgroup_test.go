@@ -111,6 +111,41 @@ func TestEffortOf(t *testing.T) {
 	}
 }
 
+// TestFitEffort 面板保存时的档位自动更正（用户请求的核心规则）：
+//
+//	|max 但模型没有 max → 最高档；|low 但模型没有 low → 最低档；
+//	模型支持该档 / 未加注 / 能力未知 / 档位词不在强弱序 → 一律不动。
+func TestFitEffort(t *testing.T) {
+	cases := []struct {
+		name      string
+		effort    string
+		supported []string
+		want      string
+		changed   bool
+	}{
+		{"支持则不变", "max", []string{"low", "high", "max"}, "max", false},
+		{"max缺失→最高档", "max", []string{"low", "high"}, "high", true},
+		{"low缺失→最低档", "low", []string{"high", "xhigh"}, "high", true},
+		{"中间档缺失→降级到最近低档", "medium", []string{"low", "high"}, "low", true},
+		{"低于最低档→最低档", "off", []string{"low", "high"}, "low", true},
+		{"单档表→该档", "xhigh", []string{"medium"}, "medium", true},
+		{"能力未知→不动", "max", nil, "max", false},
+		{"能力空表→不动", "max", []string{}, "max", false},
+		{"空档位→不动", "", []string{"low"}, "", false},
+		{"未知档位词→不动（不臆造）", "turbo", []string{"low", "high"}, "turbo", false},
+		{"大小写不敏感且取原文形态", "MAX", []string{"low", "Max"}, "Max", false},
+		{"空白trim", " high ", []string{"low", "high"}, "high", false},
+		{"off在表内→不动", "off", []string{"off", "low", "high"}, "off", false},
+	}
+	for _, tc := range cases {
+		got, changed := FitEffort(tc.effort, tc.supported)
+		if got != tc.want || changed != tc.changed {
+			t.Errorf("%s: FitEffort(%q, %v) = (%q, %v), want (%q, %v)",
+				tc.name, tc.effort, tc.supported, got, changed, tc.want, tc.changed)
+		}
+	}
+}
+
 // TestValidateEffortLexical 档位词法校验：小写字母/数字开头、仅小写字母数字-_、
 // 1-16 长度；大写/空格/超长拒绝（档位表本身由上游裁决，此处只拦词法错误）。
 func TestValidateEffortLexical(t *testing.T) {

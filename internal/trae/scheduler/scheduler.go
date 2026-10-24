@@ -8,8 +8,10 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/stagger"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/trae/upstream"
@@ -28,6 +30,12 @@ type Config struct {
 // Scheduler 调度器。
 type Scheduler struct {
 	cfg Config
+
+	// batchMu 全局批量闸门（与主池 scheduler 同口径，2026-10-23 事故整改第二阶段）：
+	// 签到/重试/积分刷新/token 预刷新四类批量互斥——RetryLoop 每 15min tick 与
+	// 9 点签到、CreditsLoop 启动即刷与定时签到等都可能交叉，两批并行会同窗口
+	// 打同一账号。忙时 TryLock 失败直接拒绝（定时任务下轮再跑）。零值可用。
+	batchMu sync.Mutex
 }
 
 // New 构建。
@@ -73,14 +81,40 @@ func (s *Scheduler) Run(ctx context.Context) {
 			timer.Stop()
 			return
 		case <-timer.C:
+			// 触发抖动（风控，2026-10-23 事故整改第二阶段）：整点准点批量请求是
+			// 机器人指纹，到点后随机延迟 0~5min 再跑。测试 factor=0 时返回 0。
+			if !sleepCtx(ctx, stagger.FireJitter()) {
+				return
+			}
 			h := time.Now().Hour()
 			if contains(s.cfg.RefreshHours, h) {
-				s.RunRefreshNow()
+				if s.tryAcquireBatch("trae 定时刷新") {
+					s.doRefresh()
+					s.batchMu.Unlock()
+				}
 			}
 			if s.cfg.CheckinHour == h {
-				s.RunCheckinNow()
+				if s.tryAcquireBatch("trae 定时签到") {
+					s.doCheckin()
+					s.batchMu.Unlock()
+				}
 			}
 		}
+	}
+}
+
+// sleepCtx 可取消的等待：ctx 取消立即返回 false，等满返回 true。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -93,9 +127,29 @@ func contains(hours []int, h int) bool {
 	return false
 }
 
-// RunCheckinNow 立即对所有账号执行签到 + 积分刷新 + 解冻。
+// tryAcquireBatch 全局批量闸门：拿到即独占批量执行权（调用方负责 Unlock），
+// 拿不到返回 false 并落一行拒绝日志（定时任务下轮再跑）。
+func (s *Scheduler) tryAcquireBatch(who string) bool {
+	if s.batchMu.TryLock() {
+		return true
+	}
+	log.Printf("[trae] scheduler: 批量任务执行中，%s 本轮跳过（闸门互斥）", who)
+	return false
+}
+
+// RunCheckinNow 立即对所有账号执行签到 + 积分刷新 + 解冻（手动入口，闸门互斥忙时拒绝）。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
 func (s *Scheduler) RunCheckinNow() {
+	if !s.tryAcquireBatch("trae 手动签到") {
+		return
+	}
+	defer s.batchMu.Unlock()
+	s.doCheckin()
+}
+
+// doCheckin 签到遍历本体（调用方必须已持有 batchMu）：定时槽走 Run() → 本函数。
+func (s *Scheduler) doCheckin() {
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -104,15 +158,25 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
+		// 账号间随机错峰（2026-10-23 事故整改）：同渠道多账号绝不批量同刻打上游。
+		if !first {
+			time.Sleep(stagger.Heavy())
+		}
+		first = false
 		s.checkinAccount(st, a)
 		s.refreshCredits(st, a)
 	}
 }
 
-// RunCheckinRetries 对退避到期的账号补一次签到（intraday 重试）。
+// RunCheckinRetries 对退避到期的账号补一次签到（intraday 重试，闸门互斥忙时跳过）。
 // 退避公式与持久化见 pool.NoteCheckinRateLimited；成功/已签到清零。
 // Source: autumnsentiment/Trae2api-cn @ 2403954 + @ 165ac6e
 func (s *Scheduler) RunCheckinRetries() {
+	if !s.tryAcquireBatch("trae 签到重试") {
+		return
+	}
+	defer s.batchMu.Unlock()
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -124,6 +188,11 @@ func (s *Scheduler) RunCheckinRetries() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
+		// 账号间随机错峰（2026-10-23 事故整改）。
+		if !first {
+			time.Sleep(stagger.Heavy())
+		}
+		first = false
 		s.checkinAccount(st, a)
 		s.refreshCredits(st, a)
 	}
@@ -146,10 +215,20 @@ func (s *Scheduler) RetryLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// RunCreditsNow 立即对所有账号拉取一次积分权益包明细（EntPacks）。
+// RunCreditsNow 立即对所有账号拉取一次积分权益包明细（EntPacks，闸门互斥忙时拒绝）。
 // 与签到路径共享 refreshCredits：SetCreditExpiry 覆盖内存快照时触发权威余量差
 // 校准（pool.calibrateLocked），使 DeductCredits 的换算系数逐步收敛到真实值。
 func (s *Scheduler) RunCreditsNow() {
+	if !s.tryAcquireBatch("trae 积分刷新") {
+		return
+	}
+	defer s.batchMu.Unlock()
+	s.doCredits()
+}
+
+// doCredits 积分明细遍历本体（调用方必须已持有 batchMu）。
+func (s *Scheduler) doCredits() {
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -158,6 +237,11 @@ func (s *Scheduler) RunCreditsNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
+		// 账号间随机错峰（2026-10-23 事故整改）；EntPacks 是轻查询，用 Light 档。
+		if !first {
+			time.Sleep(stagger.Light())
+		}
+		first = false
 		s.refreshCredits(st, a)
 	}
 }
@@ -277,8 +361,18 @@ func (s *Scheduler) refreshCredits(st pool.Status, a *auth.Auth) {
 	s.cfg.Pool.SetCreditExpiry(st.UID, earliest, packsSnapshot)
 }
 
-// RunRefreshNow 立即对所有账号刷新 token；session 失效的自动禁用。
+// RunRefreshNow 立即对所有账号刷新 token；session 失效的自动禁用（闸门互斥忙时拒绝）。
 func (s *Scheduler) RunRefreshNow() {
+	if !s.tryAcquireBatch("trae token 刷新") {
+		return
+	}
+	defer s.batchMu.Unlock()
+	s.doRefresh()
+}
+
+// doRefresh token 预刷新遍历本体（调用方必须已持有 batchMu）。
+func (s *Scheduler) doRefresh() {
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -287,6 +381,11 @@ func (s *Scheduler) RunRefreshNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
+		// 账号间随机错峰（2026-10-23 事故整改）：同一秒批量刷新 token 正是风控诱因。
+		if !first {
+			time.Sleep(stagger.Heavy())
+		}
+		first = false
 		// 持锁内重查，避免与签到路径的刷新并发重复 ExchangeToken。
 		// 注意：失败时返回 (false, err)，必须先判 err 再判 refreshed。
 		refreshed, err := s.cfg.Upstream.RefreshTokenIfNeeded(a, s.cfg.RefreshSkew)

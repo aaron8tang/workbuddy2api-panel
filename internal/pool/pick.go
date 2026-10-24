@@ -1,4 +1,4 @@
-// 选号：Pick 簇（healthy 成本分层 + 快过期虚拟实例权重 + 全冷却兜底 + 在途占满过滤）。
+// 选号：Pick 簇（healthy 成本分层 + 快过期虚拟实例权重 + 批次到期时分秒 FEFO + 全冷却兜底 + 在途占满过滤）。
 package pool
 
 import (
@@ -164,6 +164,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		tier   int
 		cost1k float64
 		rank   int
+		fefo   time.Time // 批次积分最早到期时刻（时分秒级，零值=无明细）
 	}
 	ws := make([]weighted, 0, len(cands))
 	for _, e := range cands {
@@ -173,7 +174,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			if v, ok := orderRank[e.a.UID]; ok {
 				r = v
 			}
-			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci, rank: r})
+			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci, rank: r, fefo: e.fefoExpiry(now)})
 		}
 	}
 	// 快过期硬优先（issue：31 天后才到期的号也被抽中）：候选中存在有效快过期账号时，
@@ -184,10 +185,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// 自然失效回退全集，不会无号可用。prefer_expiring=false 整段跳过（旧语义）。
 	// 注：此时 ws 已过成本分层，故硬优先作用于同成本层内——限免层存在时先保免费，
 	// 再在免费层内先用快过期号（共享观测使全池同层，两层叠加语义一致）。
+	fefoTier := false // 本轮选号是否收敛到「到期序取首」模式（决定抽取语义）
 	if p.preferExpiring && len(ws) > 0 {
 		n := 0
 		for i := range ws {
-			if expiringNow(ws[i].e, now) {
+			if p.expiringNow(ws[i].e, now) {
 				ws[n] = ws[i]
 				n++
 			}
@@ -195,6 +197,19 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if n > 0 && n < len(ws) {
 			log.Printf("[pool] expiring hard tier model=%s realm=%q kept=%d/%d candidates", reqModel, realm, n, len(ws))
 			ws = ws[:n]
+			// 批次积分到期时分秒 FEFO（收敛成功时生效）：临期层内从加权随机升级为
+			// 按最早未到期批次的失效时刻升序**取首**——两账号都「快过期」但一个
+			// 20:00 整点过期、一个 20:00:30 过期时，先用掉只多活 30 秒的那份。
+			// 数据源 fefoExpiry：pkgs 明细（NoteModelCost 每调用 FEFO 实时扣减，
+			// 精度最高）优先，回退签到快照 creditsEarliestExpiry。全层无明细
+			// （fefo 零值并列）时退化为下方既有比较器（rank/cost1k/权重），零回归。
+			// 手工顺序模式不启用：rank 主序即用户指定的使用优先级，FEFO 取首
+			// 与截 1 语义冲突；远期包也不该压过手工排序（与 trae 池同约定）。
+			// 注意：必须在 ws=ws[:n] 之前捕获 len 判定——截断后 len(ws)==n，
+			// 再判 n<len(ws) 恒假会导致本模式永不启用。
+			if len(orderRank) == 0 {
+				fefoTier = true
+			}
 		}
 	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
@@ -222,6 +237,19 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		// 手工使用顺序最高优先：order 内名次小者在前（顺序即使用优先级）。
 		if ws[i].rank != ws[j].rank {
 			return ws[i].rank < ws[j].rank
+		}
+		// 批次积分到期时分秒 FEFO（全局键）：谁最早失效先用谁。有明细（fefo 非
+		// 零值）恒排在无明细（零值）之前——2 天后到期的号恒先于 16 天后到期的号，
+		// 不再要求先落入快过期层；批次扣减（NoteModelCost → consumePkgsLocked）
+		// 实时更新最早失效时刻，用完即让位。双方均无明细（零值并列）时本键不
+		// 生效，退化为成本/权重比较（无明细快照的部署行为不变）。挂在 prefer_
+		// expiring 开关下（关闭恢复纯加权路由）；手工顺序模式不启用：rank 主序
+		// 即用户指定的使用优先级，FEFO 不该压过手工排序（与临期层收缩同约定）。
+		if p.preferExpiring && len(orderRank) == 0 && !ws[i].fefo.Equal(ws[j].fefo) {
+			if ws[i].fefo.IsZero() != ws[j].fefo.IsZero() {
+				return ws[j].fefo.IsZero() // 有明细在前，无明细垫底
+			}
+			return ws[i].fefo.Before(ws[j].fefo)
 		}
 		// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
 		// 在前；tier 0/1 层 cost1k 恒 0，本比较退化为权重比较）——读缓存字段不现算。
@@ -273,6 +301,16 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 				e = c
 			}
 		}
+	} else if fefoTier || (p.preferExpiring && len(orderRank) == 0 && !ws[0].fefo.IsZero()) {
+		// 批次到期时分秒 FEFO 取首：eligible 保序（= 排序后 top5 的防撞号过滤
+		// 子集），eligible[0] 即「最早失效且当前可用的账号」。首个仍在 minPickGap
+		// 窗口内时顺延下一个（有效期更晚、紧迫度略低），与 trae 池 eligible[0]
+		// 语义一致——轮询序 = 到期序。
+		// fefoTier = 临期层收敛（原有路径）；后者 = 全局 FEFO 键生效（排序后
+		// ws[0] 带最早批次明细）。两者都取首而非加权随机——FEFO 排完序再抽签
+		// 会让排序形同虚设（权重大的远期号照样抽中）。仅当候选含批次明细时
+		// 生效：全员无明细（ws[0].fefo 零值）保持 pickWeighted（老部署零回归）。
+		e = eligible[0]
 	} else {
 		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
 	}
@@ -507,19 +545,59 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	return w
 }
 
-// expiringNow 报告账号是否存在当前仍有效的快过期积分批次。
-func expiringNow(e *entry, now time.Time) bool {
-	return e.creditsExpiring > 0 &&
+// expiringNow 报告账号是否存在当前仍有效的快过期积分批次。两个信号源取并集：
+//   - 聚合快照信号（签到/余额刷新写入）：creditsExpiring/creditsEarliestRemaining/
+//     creditsEarliestExpiry 三者同时有效。三者由同一写入口成组更新，但存在时序性
+//     缺失（上游明细缺批次时 earliest 恒空），单看会漏判。
+//   - 包明细信号（每日拉取的 e.pkgs，NoteModelCost 实时 FEFO 扣减）：存在未过期
+//     且 ExpireAt ≤ now+窗口 的批次即命中。精确到时刻（非天粒度），与 fefoExpiry
+//     的「首个未过期包」遍历同口径，统一了面板 pkgs 视图与路由快照两套数据源。
+//
+// 窗口 p.expiringSoonDur ≤0 时包明细信号关闭（缺省即旧行为，测试不注入也稳定）。
+// 调用方必须已持有 p.mu。
+func (p *Pool) expiringNow(e *entry, now time.Time) bool {
+	if e.creditsExpiring > 0 &&
 		e.creditsEarliestRemaining > 0 &&
 		!e.creditsEarliestExpiry.IsZero() &&
-		e.creditsEarliestExpiry.After(now)
+		e.creditsEarliestExpiry.After(now) {
+		return true
+	}
+	if p.expiringSoonDur <= 0 {
+		return false
+	}
+	cutoff := now.Add(p.expiringSoonDur)
+	for _, k := range e.pkgs {
+		if now.Before(k.ExpireAt) {
+			// pkgs FEFO 序：首个未过期批次即最早批次，再晚的必然不早于它。
+			return k.Remain > 0 && !k.ExpireAt.After(cutoff)
+		}
+	}
+	return false
+}
+
+// fefoExpiry 返回账号最早未到期积分批次的失效时刻（时分秒级 FEFO 排序键）。
+// 包明细（e.pkgs 按 ExpireAt 升序，NoteModelCost 每调用 FEFO 实时扣减、精度
+// 最高）优先，逐包跳过已过期的陈旧条目（快照每日才刷新，期间跨过失效时刻
+// 的包积分已作废，不参与排序）；无明细时回退签到快照 creditsEarliestExpiry
+// （同样须在未来）。两者皆无返回零值（排序时并列 → 不影响既有比较链）。
+// 调用方必须已持有 p.mu。
+func (e *entry) fefoExpiry(now time.Time) time.Time {
+	for _, k := range e.pkgs {
+		if now.Before(k.ExpireAt) {
+			return k.ExpireAt
+		}
+	}
+	if e.creditsEarliestExpiry.After(now) {
+		return e.creditsEarliestExpiry
+	}
+	return time.Time{}
 }
 
 // routingWeightOf 在普通账号权重上叠加快过期虚拟实例数量。prefer_expiring=false
 // 或账号无有效快过期批次时，实例数恒为 1，结果与旧 weightOf 完全一致。
 func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	w := p.weightOf(e, maxCredits, now)
-	if p.preferExpiring && expiringNow(e, now) {
+	if p.preferExpiring && p.expiringNow(e, now) {
 		return w * expiringVirtualSlots
 	}
 	return w

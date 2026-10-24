@@ -70,6 +70,12 @@ type chatStat struct {
 	clientIP  string
 	userAgent string
 
+	// onOutcome 子网关（trae/cosy 系）回传生效 outcome 的回调（chatCompletions
+	// 分发处注入；reqlog.OutcomeReporter 免 import cycle）。子网关 SSE 已写 200
+	// 头时状态码无法表达流内业务错误，经此回传让面板「请求记录/表格行」如实显示
+	// 失败。status/outcome 以后到的回传为准（done() 前生效）。
+	onOutcome reqlog.OutcomeReporter
+
 	logged bool
 }
 
@@ -90,6 +96,21 @@ func (s *chatStat) done() {
 	s.logged = true
 	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
 		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+}
+
+// reportOutcome 子网关回传生效 outcome 的入口（reqlog.OutcomeReporter 形状）：
+// 覆写 status/outcome 供表格行与 reqlog.Event 使用。SSE 已 200 的流内业务错误
+// 由子网关传语义状态码（如 502），面板展示与账号列同源更新。
+func (s *chatStat) reportOutcome(uid, nick, outcome string, httpStatus int) {
+	if uid != "" {
+		s.uid, s.nick = uid, nick
+	}
+	if httpStatus > 0 {
+		s.status = httpStatus
+	}
+	if outcome != "" {
+		s.outcome = outcome
+	}
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，

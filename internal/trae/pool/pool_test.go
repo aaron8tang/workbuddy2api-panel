@@ -617,35 +617,85 @@ func TestWorkOrderRankPriority(t *testing.T) {
 	}
 }
 
-// expPickAt 以「今天 12:00」为基准返回 now+days 天后的 Unix 秒（天粒度窗口
-// 口径测试用：d = 到期日 - 今天，12:00 避开日界边界）。
+// expPickAt 以「今天 12:00」为基准返回 now+days 天后的 Unix 秒（12:00 避开
+// 日界边界；days≥1 恒在未来。days=0 午后运行会翻车为过去时刻，禁止使用）。
 func expPickAt(days int) int64 {
 	now := time.Now()
 	return time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, now.Location()).AddDate(0, 0, days).Unix()
 }
 
-// TestPickAffinityExpiringHardTier 自动模式下 24h 窗口内有到期积分的账号硬优先
+// withNoPickGap 临时关闭防并发撞号窗口（minPickGap=0），让连续 Pick 的确定性
+// 断言不受 100ms 防撞窗口影响（与主池 pool_test.go 同约定）。
+func withNoPickGap(t *testing.T) {
+	t.Helper()
+	old := minPickGap
+	minPickGap = 0
+	t.Cleanup(func() { minPickGap = old })
+}
+
+// TestPickAffinityExpiringHardTier 自动模式下存在未来批次积分的账号硬优先收敛
 // （issue 实案：积分最高 4600、最早包 19 天后才到期的远期号 25567921 霸占选号，
-// 117/24 积分的临期号被晾着）。候选收敛到临期集合后按 FEFO 先用最早到期的。
+// 117/24 积分的临期号被晾着）。收敛集内按 FEFO 先用最早失效的（精确到时分秒），
+// 无未来批次的账号（none）中签率为 0。
 func TestPickAffinityExpiringHardTier(t *testing.T) {
+	withNoPickGap(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "far"})  // 4600 积分，19 天后到期
 	p.Add(&auth.Auth{UID: "exp1"}) // 117 积分，明天到期
-	p.Add(&auth.Auth{UID: "exp0"}) // 24 积分，今天到期（FEFO 首选）
+	p.Add(&auth.Auth{UID: "exp0"}) // 24 积分，2 分钟后到期（FEFO 首选）
+	p.Add(&auth.Auth{UID: "none"}) // 无权益包（fefe=0，被硬过滤剔除）
 	p.SetCredits("far", 4600)
 	p.SetCredits("exp1", 117)
 	p.SetCredits("exp0", 24)
+	p.SetCredits("none", 50)
 	p.SetCreditExpiry("far", expPickAt(19), []CreditPack{{ExpireAt: expPickAt(19), Remain: 4600}})
 	p.SetCreditExpiry("exp1", expPickAt(1), []CreditPack{{ExpireAt: expPickAt(1), Remain: 117}})
-	p.SetCreditExpiry("exp0", expPickAt(0), []CreditPack{{ExpireAt: expPickAt(0), Remain: 24}})
+	soon := time.Now().Add(2 * time.Minute).Unix()
+	p.SetCreditExpiry("exp0", soon, []CreditPack{{ExpireAt: soon, Remain: 24}})
 
-	// 候选收敛 {exp0, exp1}，FEFO 先选今天到期的 exp0
+	// 硬过滤收敛到 {far, exp1, exp0}，FEFO 先选最早失效的 exp0
 	if g := p.PickExcluding(nil); g == nil || g.UID != "exp0" {
 		t.Fatalf("expiring hard tier should pick exp0 (earliest expiry), got %+v", g)
 	}
-	// 排除 exp0（请求级轮转）→ exp1；积分最高的 far 必须落选
+	// 排除 exp0（请求级轮转）→ exp1；积分最高的 far 必须排在其后
 	if g := p.PickExcluding(map[string]bool{"exp0": true}); g == nil || g.UID != "exp1" {
 		t.Fatalf("exp1 should be picked after exp0 excluded; far must lose, got %+v", g)
+	}
+	// 再排除 exp1 → 轮到 far（远期批次仍排在无批次 none 之前）
+	if g := p.PickExcluding(map[string]bool{"exp0": true, "exp1": true}); g == nil || g.UID != "far" {
+		t.Fatalf("far should be picked after exp0/exp1 excluded; none must lose, got %+v", g)
+	}
+}
+
+// TestPickAffinitySecondsFEFO 秒级 FEFO：不同未来时刻（时分秒不同）的账号按最早
+// 失效时刻升序轮询；已过期与扣穿的批次包不参与排序（earliestPackExpiry 跳过）。
+func TestPickAffinitySecondsFEFO(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "early"}) // 90 秒后失效（多包中含过期/扣穿死包，应被跳过）
+	p.Add(&auth.Auth{UID: "late"})  // 3 分钟后失效
+	p.Add(&auth.Auth{UID: "none"})  // 无权益包
+	now := time.Now()
+	p.SetCredits("early", 100)
+	p.SetCredits("late", 200)
+	p.SetCredits("none", 50)
+	p.SetCreditExpiry("early", now.Add(90*time.Second).Unix(), []CreditPack{
+		{ExpireAt: now.Add(-1 * time.Hour).Unix(), Remain: 30}, // 已过期 → 跳过
+		{ExpireAt: now.Add(90 * time.Second).Unix(), Remain: 50},
+		{ExpireAt: now.Add(90 * time.Second).Unix(), Remain: 0}, // 扣穿 → 跳过
+	})
+	p.SetCreditExpiry("late", now.Add(3*time.Minute).Unix(), []CreditPack{
+		{ExpireAt: now.Add(3 * time.Minute).Unix(), Remain: 200},
+	})
+
+	for i := 0; i < 10; i++ {
+		if g := p.Pick(); g == nil || g.UID != "early" {
+			t.Fatalf("iter %d: pick=%+v, want early (expires 90s before late)", i, g)
+		}
+	}
+	// none（无未来批次）不能插队
+	if g := p.PickExcluding(map[string]bool{"early": true, "late": true}); g == nil || g.UID != "none" {
+		t.Fatalf("none should only be reachable when both expiring accounts excluded, got %+v", g)
 	}
 }
 

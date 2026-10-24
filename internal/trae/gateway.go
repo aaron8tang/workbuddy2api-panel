@@ -193,6 +193,18 @@ func (g *Gateway) EarliestCreditExpiry() (time.Time, bool) {
 	return nextMonthlyReset(now, g.cfg.CreditResetDay), true
 }
 
+// HasExpiringWithin 报告 trae 渠道是否有积分将在 d 内到期（供跨渠道调度
+// 「即将到期优先用完」判断）。数据源与 EarliestCreditExpiry 一致：优先取健康
+// 账号权益包明细的最早到期时刻，无明细时按月度重置日估算兜底；两者都不可得
+// （渠道不可服务/重置日关闭）时返回 false（按「无即将到期」处理，排已知之后）。
+func (g *Gateway) HasExpiringWithin(d time.Duration) bool {
+	exp, ok := g.EarliestCreditExpiry()
+	if !ok {
+		return false
+	}
+	return time.Until(exp) <= d
+}
+
 // nextMonthlyReset 返回 now 之后下一次「每月 day 日 00:00（本地时区）」时刻。
 // day 超出当月天数时钳到月末（29/30/31 在平月自动回退到 28/末日）。
 func nextMonthlyReset(now time.Time, day int) time.Time {

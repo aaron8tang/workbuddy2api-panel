@@ -629,7 +629,20 @@ type Client struct {
 	defaultEfforts map[string]map[string]string
 	// modelRates 缓存各模型当前生效积分倍率（规范化数值，如 "0.5"）。
 	// 与 efforts 共用 realm 分层和锁；每次成功刷新模型目录时整体替换对应域。
+	//
+	// 限时优惠的**时段性**（如夜间免费 23:00→7:50）不能只靠「目录刷新时算一遍」：
+	// 目录缓存 10min TTL 且只在被访问时懒刷新，静止流量下快照可能几小时不更新，
+	// 免费窗口结束后倍率仍停留在 0 → 模型组按「倍率升序」继续把该模型排第一，
+	// 用户在 8 点后被收全价。因此快照同时存每模型的**优惠窗口定义**，读取时按
+	// 当前时刻重估（modelRateEffective），窗口外自动回落牌价。
 	modelRates map[string]map[string]string
+	// modelRateWindows 与 modelRates 平行：模型 → 该模型生效优惠的时段表
+	//（无优惠/全天候优惠的模型不出现在此 map，读取时直接用牌价）。
+	modelRateWindows map[string]map[string][]promoDailyWindow
+	// modelRateBase 牌价桶（时段型优惠窗口外回落用）：模型 → 未打折倍率。
+	// modelRates 存的是「生效价」（窗口内 = 折扣价），窗口外需要牌价回落，
+	// 必须另存一份，否则回落时会错把折扣价当牌价。
+	modelRateBase map[string]map[string]string
 
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
@@ -1417,10 +1430,13 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 // nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
 // 失败返回错误（调用方降级为仅企业端点）。
 func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
-	byID, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
+	byID, wins, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
 	if err != nil {
 		return nil, err
 	}
+	// 时段型优惠快照立即入库：CN 主目录在此路解析（企业端点无 modelPromotions），
+	// FetchModels 合并后统一 storeModelRates，窗口须先存好。
+	c.storeModelRateWindows(a.Realm(), wins)
 	out := make([]ModelInfo, 0, len(byID))
 	for _, mi := range byID {
 		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
@@ -1432,6 +1448,20 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("v3/config returned empty models")
 	}
 	return out, nil
+}
+
+// promoDailyWindow 一段每日循环的优惠窗口（分钟数，支持跨午夜）。
+// 从 v3ModelPromotion.Schedule.Daily 提取——时段型优惠（如夜间免费）在窗口外
+// 不再生效，倍率读取时按当前时刻重估。
+type promoDailyWindow struct{ Start, End int } // 当日分钟；Start > End = 跨午夜
+
+// v3PromoSnapshot 一次目录刷新解析出的、某模型**当日生效**优惠的可重估快照：
+// 牌价不变，只有窗口内的 discounted 生效。
+type v3PromoSnapshot struct {
+	Windows []promoDailyWindow // nil = 无时段表（validFrom/Until 已在刷新时评估过，之后恒生效）
+	// Discounted 折扣后倍率（规范化数值，如 "0"）；无 discount 对象的 badge-only
+	// 优惠不影响倍率，不会进快照。
+	Discounted string
 }
 
 // v3ModelPromotion /v3/config data.modelPromotions 单条优惠定义（2026-09-23 实测
@@ -1530,9 +1560,15 @@ func promoActive(p *v3ModelPromotion, now time.Time) bool {
 // applyModelPromotions 把当前生效的优惠挂到目录条目：同模型多条命中取 priority
 // 最高（实测 glm-5.2 白天 badge-only(50) 与夜间五折(100) 靠 priority+daily 双轨
 // 切换）。无 discount 对象的条目也挂标签/说明（错峰类），PromoFactor 留 nil。
-func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
+//
+// 第三返回值是**时段型优惠的可重估快照**（模型 → 窗口+折扣价）：discount 带
+// daily 时段表的优惠不能只在此刻评估一次（目录缓存 10min TTL，静止流量下快照
+// 几小时不更新，免费窗口结束后倍率仍停留在 0），由 storeModelRates 存下、
+// ModelRate 读取时按当前时刻重估。
+func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) map[string]v3PromoSnapshot {
+	windows := map[string]v3PromoSnapshot{}
 	if len(promos) == 0 || len(out) == 0 {
-		return
+		return windows
 	}
 	now := time.Now().In(promoZone)
 	type cand struct {
@@ -1566,9 +1602,27 @@ func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
 			f := c.p.Discount.Factor
 			mi.PromoFactor = &f
 			mi.PromoCredits = c.p.Discount.DiscountedCredits
+			// 带 daily 时段表的折扣优惠：额外记快照供读取时重估
+			//（badge-only 的「错峰使用」类无 factor，不影响倍率，不入快照；
+			// Schedule 可能整个缺省——纯 validFrom/Until 型优惠无时段表）。
+			if c.p.Schedule != nil && len(c.p.Schedule.Daily) > 0 {
+				ws := make([]promoDailyWindow, 0, len(c.p.Schedule.Daily))
+				for _, w := range c.p.Schedule.Daily {
+					st, ok1 := promoClock(w.Start)
+					ed, ok2 := promoClock(w.End)
+					if !ok1 || !ok2 {
+						continue
+					}
+					ws = append(ws, promoDailyWindow{Start: st, End: ed})
+				}
+				if len(ws) > 0 {
+					windows[id] = v3PromoSnapshot{Windows: ws, Discounted: normalizeModelRate(c.p.Discount.DiscountedCredits)}
+				}
+			}
 		}
 		out[id] = mi
 	}
+	return windows
 }
 
 // storeEfforts 按 realm 写入 effort 能力缓存桶（efforts + defaultEfforts），并发安全。
@@ -1633,6 +1687,7 @@ func effectiveModelRate(mi ModelInfo) string {
 // 倍率时写入空桶，使旧倍率不会继续冒充当前价。
 func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	rates := make(map[string]string, len(infos))
+	base := make(map[string]string, len(infos))
 	for _, mi := range infos {
 		if mi.ID == "" {
 			continue
@@ -1640,23 +1695,107 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 		if rate := effectiveModelRate(mi); rate != "" {
 			rates[mi.ID] = rate
 		}
+		// 牌价独立落桶：时段型优惠窗口外 ModelRate 回落用（0 值牌价与未知
+		// 等价处理——免费牌价不该有，有也只会让回落到 0，风险方向无害）。
+		if b := normalizeModelRate(mi.Credits); b != "" {
+			base[mi.ID] = b
+		}
 	}
 	c.effortsMu.Lock()
 	defer c.effortsMu.Unlock()
 	if c.modelRates == nil {
 		c.modelRates = make(map[string]map[string]string)
 	}
+	if c.modelRateBase == nil {
+		c.modelRateBase = make(map[string]map[string]string)
+	}
 	c.modelRates[realmKey(realm)] = rates
+	c.modelRateBase[realmKey(realm)] = base
 }
 
-// ModelRate 返回最近成功刷新的指定域模型生效倍率；未知返回空串。
+// storeModelRateWindows 按 realm 整体替换时段型优惠快照（nil/空 = 清空该域桶）。
+// 与 storeModelRates 配对：一次目录刷新同时落「倍率」与「窗口」，ModelRate 读取
+// 时按当前时刻重估窗口，免费/折扣价在窗口外自动回落牌价。
+func (c *Client) storeModelRateWindows(realm string, windows map[string]v3PromoSnapshot) {
+	c.effortsMu.Lock()
+	defer c.effortsMu.Unlock()
+	if c.modelRateWindows == nil {
+		c.modelRateWindows = make(map[string]map[string][]promoDailyWindow)
+	}
+	k := realmKey(realm)
+	if len(windows) == 0 {
+		delete(c.modelRateWindows, k)
+		return
+	}
+	bucket := make(map[string][]promoDailyWindow, len(windows))
+	for id, w := range windows {
+		if len(w.Windows) > 0 && w.Discounted != "" {
+			bucket[id] = w.Windows
+		}
+	}
+	if len(bucket) == 0 {
+		delete(c.modelRateWindows, k)
+		return
+	}
+	c.modelRateWindows[k] = bucket
+}
+
+// promoInWindow now 是否落在任一窗口内（支持跨午夜：Start > End 时
+// now >= Start || now < End，与 promoActive 的判定同式）。
+func promoInWindow(ws []promoDailyWindow, now time.Time) bool {
+	cur := now.Hour()*60 + now.Minute()
+	for _, w := range ws {
+		if w.Start <= w.End {
+			if cur >= w.Start && cur < w.End {
+				return true
+			}
+		} else if cur >= w.Start || cur < w.End {
+			return true
+		}
+	}
+	return false
+}
+
+// ModelRate 返回**此刻**生效的指定域模型倍率；未知返回空串。
+//
+// 时段型优惠（如夜间免费 23:00→7:50）在读取时重估：目录刷新时快照里的倍率
+// 可能已过期（目录缓存 10min TTL 且懒刷新，静止流量下几小时不更新），若直接
+// 返回快照值，免费窗口结束后模型组仍按「倍率 0 升序」把它排第一，8 点后照样
+// 选中收全价（实测案例：hy4-preview 08:00:58 仍被选中，单次扣 41 积分）。窗口
+// 外返回牌价，模型组排序与积分保底判定即刻看到真实价格。
 func (c *Client) ModelRate(realm, model string) string {
+	if c == nil {
+		return ""
+	}
+	return c.modelRateAt(realm, model, time.Now().In(promoZone))
+}
+
+// modelRateAt ModelRate 的时钟注入版（单测驱动窗口内/外两分支）。
+func (c *Client) modelRateAt(realm, model string, now time.Time) string {
 	if c == nil || model == "" {
 		return ""
 	}
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
-	return c.modelRates[realmKey(realm)][model]
+	k := realmKey(realm)
+	rate := c.modelRates[k][model]
+	// 窗口重估：该模型挂了时段型优惠且此刻不在窗口内 → 回落牌价。
+	// modelRates 里的值在窗口内本就是折扣价（effectiveModelRate 取 PromoCredits），
+	// 所以只需处理「窗口外」这一支；窗口内直接用快照值（与刷新时一致）。
+	if ws, ok := c.modelRateWindows[k][model]; ok && !promoInWindow(ws, now) {
+		// 牌价回落：modelRateBase 存刷新条目的原始 Credits。查不到时保守返回
+		// 快照值（不编造价格）。
+		if base, ok2 := c.modelRateBase[k][model]; ok2 {
+			return base
+		}
+	}
+	return rate
+}
+
+// EffortSnapshot 按 realm 导出 effort 能力缓存（远端探测下发值），
+// 供面板/路由层查询「该模型实际支持哪几档思考」。返回副本；桶未填充 → nil。
+func (c *Client) EffortSnapshot(realm string) (efforts map[string][]string, defaults map[string]string) {
+	return c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 }
 
 // GlobalEffortSnapshot 导出 global 域 effort 能力缓存（探测下发 ∪ 静态兜底合并后的桶），
@@ -1686,10 +1825,10 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 // 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
 // ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。该端点对 UA 敏感且**不同 UA 下发
 // 不同模型集合**（见 codeBuddyCLIUA 注释），global 探测据此并发两路取并集。
-func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
+func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, map[string]v3PromoSnapshot, error) {
 	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -1707,16 +1846,16 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	c.injectCodeBuddyRequest(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		// 读失败 → 传输层错误：半截 body 不进解析（不罚号）。
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, nil, fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("v3/config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, nil, fmt.Errorf("v3/config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
 	var env struct {
 		Code int `json:"code"`
@@ -1737,10 +1876,10 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("v3/config parse: %w", err)
+		return nil, nil, fmt.Errorf("v3/config parse: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, fmt.Errorf("v3/config code=%d", env.Code)
+		return nil, nil, fmt.Errorf("v3/config code=%d", env.Code)
 	}
 	out := make(map[string]ModelInfo, len(env.Data.Models))
 	for _, m := range env.Data.Models {
@@ -1781,12 +1920,12 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	// 挂当前生效的限时优惠（modelPromotions）：Credits 字段是**牌价**（转正后基准
 	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/
 	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
-	applyModelPromotions(out, env.Data.ModelPromotions)
+	windows := applyModelPromotions(out, env.Data.ModelPromotions)
 
 	if len(out) == 0 {
-		return nil, fmt.Errorf("v3/config returned empty models")
+		return nil, nil, fmt.Errorf("v3/config returned empty models")
 	}
-	return out, nil
+	return out, windows, nil
 }
 
 // UserResource 查询账号积分余额与总额度（所有套餐聚合）。remain 负值钳 0；
